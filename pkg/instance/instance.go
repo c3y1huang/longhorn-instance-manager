@@ -212,7 +212,7 @@ func (ops V2DataEngineInstanceOps) InstanceCreate(req *rpc.InstanceCreateRequest
 		}
 		return replicaResponseToInstanceResponse(replica), nil
 	case types.InstanceTypeShard:
-		shard, err := c.ShardCreate(req.Spec.VolumeName, req.Spec.SpdkInstanceSpec.SlotIndex, req.Spec.SpdkInstanceSpec.Size, req.Spec.SpdkInstanceSpec.DiskName, req.Spec.SpdkInstanceSpec.DiskUuid, req.Spec.PortCount)
+		shard, err := c.ShardCreate(req.Spec.VolumeName, req.Spec.SpdkInstanceSpec.SlotIndex, req.Spec.SpdkInstanceSpec.Size, req.Spec.SpdkInstanceSpec.LvsName, req.Spec.SpdkInstanceSpec.LvsUuid, req.Spec.PortCount)
 		if err != nil {
 			return nil, err
 		}

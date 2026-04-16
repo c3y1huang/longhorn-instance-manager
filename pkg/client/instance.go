@@ -96,6 +96,10 @@ type EngineCreateRequest struct {
 	TargetAddress     string
 	UpgradeRequired   bool
 	SalvageRequested  bool
+	EcShards          map[string]*rpc.EcShardInfo
+	EcDataChunks      uint32
+	EcParityChunks    uint32
+	EcStripSizeKb     uint32
 }
 
 type EngineFrontendCreateRequest struct {
@@ -113,6 +117,13 @@ type ReplicaCreateRequest struct {
 	BackingImageName string
 }
 
+type ShardCreateRequest struct {
+	LvsName   string
+	LvsUuid   string
+	SlotIndex uint32
+	PortCount int32
+}
+
 type InstanceCreateRequest struct {
 	DataEngine   string
 	Name         string
@@ -128,6 +139,7 @@ type InstanceCreateRequest struct {
 	Engine         EngineCreateRequest
 	EngineFrontend EngineFrontendCreateRequest
 	Replica        ReplicaCreateRequest
+	Shard          ShardCreateRequest
 
 	// Deprecated: replaced by DataEngine.
 	BackendStoreDriver string
@@ -166,6 +178,14 @@ func (c *InstanceServiceClient) InstanceCreate(req *InstanceCreateRequest) (*api
 				UblkQueueDepth:    int32(req.Engine.UblkQueueDepth),
 				UblkNumberOfQueue: int32(req.Engine.UblkNumberOfQueue),
 			}
+			if len(req.Engine.EcShards) > 0 {
+				spdkInstanceSpec.EcSpec = &rpc.EcSpec{
+					Shards:       req.Engine.EcShards,
+					DataChunks:   req.Engine.EcDataChunks,
+					ParityChunks: req.Engine.EcParityChunks,
+					StripSizeKb:  req.Engine.EcStripSizeKb,
+				}
+			}
 		case types.InstanceTypeEngineFrontend:
 			spdkInstanceSpec = &rpc.SpdkInstanceSpec{
 				Size:              req.Size,
@@ -180,6 +200,14 @@ func (c *InstanceServiceClient) InstanceCreate(req *InstanceCreateRequest) (*api
 				DiskUuid:         req.Replica.DiskUUID,
 				ExposeRequired:   req.Replica.ExposeRequired,
 				BackingImageName: req.Replica.BackingImageName,
+			}
+		case types.InstanceTypeShard:
+			req.PortCount = int(req.Shard.PortCount)
+			spdkInstanceSpec = &rpc.SpdkInstanceSpec{
+				Size:      req.Size,
+				LvsName:   req.Shard.LvsName,
+				LvsUuid:   req.Shard.LvsUuid,
+				SlotIndex: req.Shard.SlotIndex,
 			}
 		default:
 			return nil, fmt.Errorf("failed to create instance: invalid instance type %v", req.InstanceType)
