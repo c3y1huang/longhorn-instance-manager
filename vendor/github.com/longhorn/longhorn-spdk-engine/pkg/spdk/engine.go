@@ -1,6 +1,7 @@
 package spdk
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
@@ -21,6 +22,8 @@ import (
 	"github.com/longhorn/go-spdk-helper/pkg/jsonrpc"
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
 
+	btypes "github.com/longhorn/backupstore/types"
+	butil "github.com/longhorn/backupstore/util"
 	commonbitmap "github.com/longhorn/go-common-libs/bitmap"
 	commonnet "github.com/longhorn/go-common-libs/net"
 	commonutils "github.com/longhorn/go-common-libs/utils"
@@ -110,16 +113,20 @@ func (m *MockReplicaAdder) ReplicaAddFinish(srcReplicaServiceCli, dstReplicaServ
 type Engine struct {
 	sync.RWMutex
 
+	ctx       context.Context
+	cancelCtx context.CancelFunc
+
+	restore *EngineRestore
+
 	Name       string
 	VolumeName string
 	SpecSize   uint64
 	ActualSize uint64
 	Frontend   string
-	Endpoint   string
 
 	ctrlrLossTimeout     int
 	fastIOFailTimeoutSec int
-	ReplicaStatusMap     map[string]*EngineReplicaStatus
+	upstreams            map[string]Upstream
 
 	RaidBdevUUID string
 
@@ -161,12 +168,6 @@ type Engine struct {
 	replicaAddFinishUnlockedHook func()
 }
 
-type EngineReplicaStatus struct {
-	Address  string
-	BdevName string
-	Mode     types.Mode
-}
-
 func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineUpdateCh chan interface{}) *Engine {
 	log := logrus.StandardLogger().WithFields(logrus.Fields{
 		"engineName": engineName,
@@ -179,7 +180,12 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineU
 	}
 	log.WithField("specSize", roundedSpecSize)
 
+	ctx, cancelCtx := context.WithCancel(context.Background())
+
 	e := &Engine{
+		ctx:       ctx,
+		cancelCtx: cancelCtx,
+
 		Name:       engineName,
 		VolumeName: volumeName,
 		Frontend:   frontend,
@@ -189,7 +195,7 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineU
 		ctrlrLossTimeout:     replicaCtrlrLossTimeoutSec,
 		fastIOFailTimeoutSec: replicaFastIOFailTimeoutSec,
 
-		ReplicaStatusMap: map[string]*EngineReplicaStatus{},
+		upstreams: map[string]Upstream{},
 
 		NvmeTcpTarget: &NvmeTcpTarget{},
 
@@ -205,8 +211,13 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineU
 	return e
 }
 
+// Create builds the engine's bdev_raid1 over the upstreams in
+// replicaAddressMap. upstreamFactory selects the upstream implementation
+// (replicaUpstream for RAID1, shardGroupUpstream for EC); it is the only
+// channel through which storage topology enters the engine. The engine
+// itself never reads DataLayoutType — see lep.md "Engine layout dispatch".
 func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[string]string, portCount int32, superiorPortAllocator *commonbitmap.Bitmap,
-	salvageRequested bool) (ret *spdkrpc.Engine, err error) {
+	salvageRequested bool, upstreamFactory UpstreamFactory) (ret *spdkrpc.Engine, err error) {
 	e.log.WithFields(logrus.Fields{
 		"portCount":         portCount,
 		"replicaAddressMap": replicaAddressMap,
@@ -229,7 +240,7 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 		return nil, fmt.Errorf("invalid state %s for engine %s creation", e.State, e.Name)
 	}
 
-	if err := e.validateReplicaSize(replicaAddressMap); err != nil {
+	if err := e.validateReplicaSize(replicaAddressMap, upstreamFactory); err != nil {
 		return nil, errors.Wrapf(err, "failed to validate replica size during engine target creation")
 	}
 
@@ -262,15 +273,15 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 		}
 	}
 
-	replicaBdevList := e.connectReplicas(spdkClient, replicaAddressMap)
+	replicaBdevList := e.connectReplicas(spdkClient, replicaAddressMap, upstreamFactory)
 
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
-		"replicaStatusMap": e.ReplicaStatusMap,
+		"replicaStatusMap": e.upstreams,
 	}, "Failed to update logger with replica status map during engine creation")
 
 	e.checkAndUpdateInfoFromReplicasNoLock()
 
-	e.log.Infof("Connected all available replicas %+v, then launching raid during engine creation", e.ReplicaStatusMap)
+	e.log.Infof("Connected all available replicas %+v, then launching raid during engine creation", e.upstreams)
 	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, ""); err != nil {
 		return nil, err
 	}
@@ -346,23 +357,24 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 	return nil
 }
 
-// connectReplicas connects to each replica's NVMf bdev and populates
-// ReplicaStatusMap. It returns the list of successfully connected bdev names.
-func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMap map[string]string) []string {
+// connectReplicas connects to each upstream's NVMf bdev and populates
+// upstreams. The upstreamFactory builds the layout-specific Upstream
+// implementation (replicaUpstream or shardGroupUpstream) — connectReplicas
+// itself stays layout-blind. It returns the list of successfully connected
+// bdev names.
+func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMap map[string]string, upstreamFactory UpstreamFactory) []string {
 	replicaBdevList := []string{}
 	for replicaName, replicaAddr := range replicaAddressMap {
-		e.ReplicaStatusMap[replicaName] = &EngineReplicaStatus{
-			Address: replicaAddr,
-		}
+		e.upstreams[replicaName] = upstreamFactory(replicaName, replicaAddr)
 
 		bdevName, err := connectNVMfBdev(spdkClient, replicaName, replicaAddr, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 		if err != nil {
 			e.log.WithError(err).Warnf("Failed to get bdev from replica %s with address %s during engine creation, will mark the mode to ERR and continue", replicaName, replicaAddr)
-			e.ReplicaStatusMap[replicaName].Mode = types.ModeERR
+			e.upstreams[replicaName].SetMode(types.ModeERR)
 		} else {
 			// TODO: Check if a replica is really a RW replica rather than a rebuilding failed replica
-			e.ReplicaStatusMap[replicaName].Mode = types.ModeRW
-			e.ReplicaStatusMap[replicaName].BdevName = bdevName
+			e.upstreams[replicaName].SetMode(types.ModeRW)
+			e.upstreams[replicaName].SetBdevName(bdevName)
 			replicaBdevList = append(replicaBdevList, bdevName)
 		}
 	}
@@ -413,12 +425,14 @@ func (e *Engine) SetTargetListenerANAState(spdkClient *spdkclient.Client, anaSta
 		return fmt.Errorf("engine %s has incomplete NVMe/TCP target information", e.Name)
 	}
 
+	targetAdrfam := spdkclient.DetectAddressFamily(ip)
+
 	_, err = spdkClient.NvmfSubsystemListenerSetANAState(
 		nqn,
 		ip,
 		strconv.Itoa(int(port)),
 		spdktypes.NvmeTransportTypeTCP,
-		spdktypes.NvmeAddressFamilyIPv4,
+		targetAdrfam,
 		spdkANAState,
 		spdktypes.DefaultNvmfANAGroupID,
 	)
@@ -444,7 +458,12 @@ func (e *Engine) SetTargetListenerANAState(spdkClient *spdkclient.Client, anaSta
 	return nil
 }
 
-func (e *Engine) validateReplicaSize(replicaAddressMap map[string]string) error {
+// validateReplicaSize is invoked before connectReplicas, so e.upstreams is
+// still empty. It uses the upstreamFactory to build ephemeral upstreams so
+// the size check dispatches through the layout-correct Get() RPC
+// (ReplicaGet for RAID1, ShardGroupGet for EC) instead of hardcoding
+// ReplicaGet.
+func (e *Engine) validateReplicaSize(replicaAddressMap map[string]string, upstreamFactory UpstreamFactory) error {
 	if len(replicaAddressMap) == 0 {
 		return fmt.Errorf("no replicas provided for engine %s", e.Name)
 	}
@@ -452,16 +471,13 @@ func (e *Engine) validateReplicaSize(replicaAddressMap map[string]string) error 
 	// Validate the engine & replica sizes before creating the engine
 	replicaSizeMap := make(map[string]uint64, len(replicaAddressMap))
 	for replicaName, replicaAddr := range replicaAddressMap {
-		replicaClient, err := GetServiceClient(replicaAddr)
+		u := upstreamFactory(replicaName, replicaAddr)
+		view, err := u.Get()
 		if err != nil {
-			return err
-		}
-		replica, err := replicaClient.ReplicaGet(replicaName)
-		if err != nil {
-			return errors.Wrapf(err, "failed to get replica %v from %v", replicaName, replicaAddr)
+			return errors.Wrapf(err, "failed to get upstream %v from %v", replicaName, replicaAddr)
 		}
 
-		replicaSizeMap[replicaName] = replica.SpecSize
+		replicaSizeMap[replicaName] = view.SpecSize
 	}
 
 	// check if all replica sizes are the same
@@ -590,6 +606,11 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 	}()
 
 	e.log.Info("Deleting engine")
+	if e.IsRestoring && e.restore != nil {
+		e.log.Info("Canceling volume restoration before engine deletion")
+		e.cancelCtx()
+		e.restore.Stop()
+	}
 
 	e.log.Infof("Stopping to expose RAID bdev for engine %s", e.Name)
 	switch e.Frontend {
@@ -632,16 +653,16 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 }
 
 func (e *Engine) disconnectReplicas(spdkClient *spdkclient.Client) (requireUpdate bool, err error) {
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		if err := disconnectNVMfBdev(spdkClient, replicaStatus.BdevName, disconnectMaxRetries, disconnectRetryInterval); err != nil {
-			if replicaStatus.Mode != types.ModeERR {
-				e.log.WithError(err).Errorf("Engine failed to disconnect replica %s with bdev %s during deletion, will update the mode from %v to ERR", replicaName, replicaStatus.BdevName, replicaStatus.Mode)
-				replicaStatus.Mode = types.ModeERR
+	for replicaName, replicaStatus := range e.upstreams {
+		if err := disconnectNVMfBdev(spdkClient, replicaStatus.BdevName(), disconnectMaxRetries, disconnectRetryInterval); err != nil {
+			if replicaStatus.Mode() != types.ModeERR {
+				e.log.WithError(err).Errorf("Engine failed to disconnect replica %s with bdev %s during deletion, will update the mode from %v to ERR", replicaName, replicaStatus.BdevName(), replicaStatus.Mode())
+				replicaStatus.SetMode(types.ModeERR)
 				requireUpdate = true
 			}
 			return requireUpdate, err
 		}
-		delete(e.ReplicaStatusMap, replicaName)
+		delete(e.upstreams, replicaName)
 		requireUpdate = true
 	}
 
@@ -697,7 +718,6 @@ func (e *Engine) getWithoutLock() (res *spdkrpc.Engine) {
 		ReplicaModeMap:        map[string]spdkrpc.ReplicaMode{},
 		Snapshots:             map[string]*spdkrpc.Lvol{},
 		Frontend:              e.Frontend,
-		Endpoint:              e.Endpoint,
 		State:                 string(e.State),
 		ErrorMsg:              e.ErrorMsg,
 		IsExpanding:           e.isExpanding,
@@ -710,9 +730,9 @@ func (e *Engine) getWithoutLock() (res *spdkrpc.Engine) {
 		res.Port = e.NvmeTcpTarget.Port
 	}
 
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		res.ReplicaAddressMap[replicaName] = replicaStatus.Address
-		res.ReplicaModeMap[replicaName] = types.ReplicaModeToGRPCReplicaMode(replicaStatus.Mode)
+	for replicaName, replicaStatus := range e.upstreams {
+		res.ReplicaAddressMap[replicaName] = replicaStatus.Address()
+		res.ReplicaModeMap[replicaName] = types.ReplicaModeToGRPCReplicaMode(replicaStatus.Mode())
 	}
 
 	res.Head = api.LvolToProtoLvol(e.Head)
@@ -738,7 +758,7 @@ type replicaAddFrontendSuspendResumeWrapper func(work func() error) error
 //     c. ReplicaRebuildingSrcStart: src replica exposes snapshot as NVMe-oF target.
 //     d. ReplicaRebuildingDstStart: dst replica attaches external snapshot, creates head.
 //     e. BdevRaidGrowBaseBdev: add dst head bdev to RAID as base bdev.
-//     f. Mark dst replica as WO in ReplicaStatusMap.
+//     f. Mark dst replica as WO in upstreams.
 //  5. Launch replicaAddAsync goroutine (Phase 1–2 below).
 //  6. Return nil (or setupErr on failure) — background goroutine takes over.
 //     On sync error: outer defer marks dst replica ERR and (if applicable) sets engine to Error state.
@@ -781,13 +801,16 @@ func (e *Engine) ReplicaAdd(spdkClient *spdkclient.Client, dstReplicaName, dstRe
 	if e.State != types.InstanceStateRunning {
 		return fmt.Errorf("invalid state %v for engine %s replica %s add start", e.State, e.Name, dstReplicaName)
 	}
+	if e.IsRestoring {
+		return fmt.Errorf("cannot add replica %s while engine %s restore is in progress", dstReplicaName, e.Name)
+	}
 
-	if _, exists := e.ReplicaStatusMap[dstReplicaName]; exists {
+	if _, exists := e.upstreams[dstReplicaName]; exists {
 		return fmt.Errorf("replica %s already exists", dstReplicaName)
 	}
 
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		if replicaStatus.Mode == types.ModeWO {
+	for replicaName, replicaStatus := range e.upstreams {
+		if replicaStatus.Mode() == types.ModeWO {
 			return fmt.Errorf("cannot add a new replica %s since there is already a rebuilding replica %s", dstReplicaName, replicaName)
 		}
 	}
@@ -812,15 +835,14 @@ func (e *Engine) ReplicaAdd(spdkClient *spdkclient.Client, dstReplicaName, dstRe
 		}
 		if engineErr != nil || err != nil {
 			prevMode := types.Mode("")
-			if e.ReplicaStatusMap[dstReplicaName] != nil {
-				prevMode = e.ReplicaStatusMap[dstReplicaName].Mode
-				e.ReplicaStatusMap[dstReplicaName].Mode = types.ModeERR
-				e.ReplicaStatusMap[dstReplicaName].Address = dstReplicaAddress
+			if e.upstreams[dstReplicaName] != nil {
+				prevMode = e.upstreams[dstReplicaName].Mode()
+				e.upstreams[dstReplicaName].SetMode(types.ModeERR)
+				e.upstreams[dstReplicaName].(*replicaUpstream).SetAddress(dstReplicaAddress)
 			} else {
-				e.ReplicaStatusMap[dstReplicaName] = &EngineReplicaStatus{
-					Mode:    types.ModeERR,
-					Address: dstReplicaAddress,
-				}
+				u := newReplicaUpstream(dstReplicaName, dstReplicaAddress)
+				u.SetMode(types.ModeERR)
+				e.upstreams[dstReplicaName] = u
 			}
 
 			e.log.WithError(err).Errorf("Engine failed to start replica %s rebuilding, will mark the rebuilding replica mode from %v to ERR", dstReplicaName, prevMode)
@@ -895,7 +917,7 @@ func (e *Engine) ReplicaAdd(spdkClient *spdkclient.Client, dstReplicaName, dstRe
 	// Reading data from this dst replica is not a good choice as the flow will be more zigzag than reading directly from the src replica:
 	// application -> RAID1 -> this base bdev (dest replica) -> the exposed snapshot (src replica).
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
-		"replicaStatusMap": e.ReplicaStatusMap,
+		"replicaStatusMap": e.upstreams,
 	}, "Failed to update logger with replica status map during engine creation")
 
 	e.log.Infof("Engine started to rebuild replica %s from healthy replica %s with fastSync %v", dstReplicaName, srcReplicaName, fastSync)
@@ -922,7 +944,7 @@ func (e *Engine) replicaAddStart(spdkClient *spdkclient.Client, replicaClients m
 	}
 
 	var replicasErr error
-	startUpdateRequired, replicasErr, engineErr = e.snapshotOperationWithoutLock(spdkClient, replicaClients, snapshotName, SnapshotOperationCreate, opts)
+	startUpdateRequired, replicasErr, engineErr = e.snapshotOperationWithoutLock(spdkClient, snapshotName, SnapshotOperationCreate, opts)
 	if replicasErr != nil {
 		return nil, startUpdateRequired, engineErr, replicasErr
 	}
@@ -976,11 +998,9 @@ func (e *Engine) replicaAddStart(spdkClient *spdkclient.Client, replicaClients m
 		return nil, startUpdateRequired, nil, errors.Wrapf(err, "failed to adding the rebuilding replica %s head bdev %s to the base bdev list for engine %s", dstReplicaName, dstHeadLvolBdevName, e.Name)
 	}
 
-	e.ReplicaStatusMap[dstReplicaName] = &EngineReplicaStatus{
-		Address:  dstReplicaAddress,
-		Mode:     types.ModeWO,
-		BdevName: dstHeadLvolBdevName,
-	}
+	u := newReplicaUpstream(dstReplicaName, dstReplicaAddress)
+	u.SetBdevName(dstHeadLvolBdevName)
+	e.upstreams[dstReplicaName] = u
 	startUpdateRequired = true
 	return rebuildingSnapshotList, startUpdateRequired, nil, nil
 }
@@ -1072,8 +1092,8 @@ func (e *Engine) replicaAddCleanupOrFinish(
 		// Real.ReplicaAddFinish before returning error) or will
 		// be handled by r.Delete() when the replica is removed.
 		e.Lock()
-		if dstStatus := e.ReplicaStatusMap[dstReplicaName]; dstStatus != nil && dstStatus.Mode != types.ModeERR {
-			dstStatus.Mode = types.ModeERR
+		if dstStatus := e.upstreams[dstReplicaName]; dstStatus != nil && dstStatus.Mode() != types.ModeERR {
+			dstStatus.SetMode(types.ModeERR)
 		}
 		e.Unlock()
 	}
@@ -1130,9 +1150,9 @@ func (e *Engine) replicaShallowCopy(dstReplicaServiceCli *client.SPDKClient, src
 		// Blindly mark the rebuilding replica as mode ERR now.
 		if err != nil {
 			e.Lock()
-			if e.ReplicaStatusMap[dstReplicaName] != nil && e.ReplicaStatusMap[dstReplicaName].Mode != types.ModeERR {
-				e.log.WithError(err).Errorf("Engine failed to do shallow copy from src replica %s to dst replica %s, will mark the rebuilding replica mode from %v to ERR", srcReplicaName, dstReplicaName, e.ReplicaStatusMap[dstReplicaName].Mode)
-				e.ReplicaStatusMap[dstReplicaName].Mode = types.ModeERR
+			if e.upstreams[dstReplicaName] != nil && e.upstreams[dstReplicaName].Mode() != types.ModeERR {
+				e.log.WithError(err).Errorf("Engine failed to do shallow copy from src replica %s to dst replica %s, will mark the rebuilding replica mode from %v to ERR", srcReplicaName, dstReplicaName, e.upstreams[dstReplicaName].Mode())
+				e.upstreams[dstReplicaName].SetMode(types.ModeERR)
 				updateRequired = true
 			}
 			e.Unlock()
@@ -1213,7 +1233,7 @@ func (e *Engine) replicaShallowCopy(dstReplicaServiceCli *client.SPDKClient, src
 // The function uses a 3-phase lock pattern to avoid holding the Engine lock during
 // potentially slow RPC calls (ReplicaRebuildingSrcFinish, ReplicaRebuildingDstFinish):
 //
-//	Phase 1 (lock):   Read dst replica mode from ReplicaStatusMap
+//	Phase 1 (lock):   Read dst replica mode from upstreams
 //	Phase 2 (unlock): Execute RPC calls (DstFinish → SrcFinish) to src/dst replicas
 //	Phase 3 (lock):   Update replica mode and engine state
 func (e *Engine) replicaAddFinish(srcReplicaServiceCli, dstReplicaServiceCli *client.SPDKClient, srcReplicaName, srcReplicaAddress, dstReplicaName, dstReplicaAddress string) error {
@@ -1222,10 +1242,10 @@ func (e *Engine) replicaAddFinish(srcReplicaServiceCli, dstReplicaServiceCli *cl
 
 	// Phase 1: Read replica state under lock
 	e.Lock()
-	dstReplicaStatus := e.ReplicaStatusMap[dstReplicaName]
+	dstReplicaStatus := e.upstreams[dstReplicaName]
 	var dstMode types.Mode
 	if dstReplicaStatus != nil {
-		dstMode = dstReplicaStatus.Mode
+		dstMode = dstReplicaStatus.Mode()
 	}
 	e.Unlock()
 
@@ -1316,16 +1336,16 @@ func (e *Engine) replicaAddFinish(srcReplicaServiceCli, dstReplicaServiceCli *cl
 	// Use the current mode (not the phase-1 snapshot dstMode) to decide the
 	// state transition, so that concurrent downgrades (e.g. validateReplicaStatusMapNoLock
 	// setting WO → ERR during unlocked phase 2) are not overwritten with RW.
-	dstReplicaStatus = e.ReplicaStatusMap[dstReplicaName]
+	dstReplicaStatus = e.upstreams[dstReplicaName]
 	if dstReplicaStatus != nil {
-		switch dstReplicaStatus.Mode {
+		switch dstReplicaStatus.Mode() {
 		case types.ModeERR:
 			updateRequired = true
 		case types.ModeWO:
 			if dstReplicaErr != nil {
-				dstReplicaStatus.Mode = types.ModeERR
+				dstReplicaStatus.SetMode(types.ModeERR)
 			} else {
-				dstReplicaStatus.Mode = types.ModeRW
+				dstReplicaStatus.SetMode(types.ModeRW)
 			}
 			updateRequired = true
 		}
@@ -1335,7 +1355,7 @@ func (e *Engine) replicaAddFinish(srcReplicaServiceCli, dstReplicaServiceCli *cl
 
 	if dstReplicaErr != nil {
 		e.log.Errorf("Engine failed to finish rebuilding replica %s from healthy replica %s (dstErr=%v)", dstReplicaName, srcReplicaName, dstReplicaErr)
-	} else if dstReplicaStatus != nil && dstReplicaStatus.Mode == types.ModeERR {
+	} else if dstReplicaStatus != nil && dstReplicaStatus.Mode() == types.ModeERR {
 		// All RPCs succeeded, but the replica mode is ERR because another
 		// goroutine (e.g. validateReplicaStatusMapNoLock) downgraded WO → ERR
 		// during the unlocked phase 2. Phase 3 correctly preserved that
@@ -1348,14 +1368,14 @@ func (e *Engine) replicaAddFinish(srcReplicaServiceCli, dstReplicaServiceCli *cl
 	return nil
 }
 
-// getReplicaAddSrcReplica picks the first RW replica from ReplicaStatusMap as the rebuild source.
+// getReplicaAddSrcReplica picks the first RW replica from upstreams as the rebuild source.
 func (e *Engine) getReplicaAddSrcReplica() (srcReplicaName, srcReplicaAddress string, err error) {
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		if replicaStatus.Mode != types.ModeRW {
+	for replicaName, replicaStatus := range e.upstreams {
+		if replicaStatus.Mode() != types.ModeRW {
 			continue
 		}
 		srcReplicaName = replicaName
-		srcReplicaAddress = replicaStatus.Address
+		srcReplicaAddress = replicaStatus.Address()
 		break
 	}
 	if srcReplicaName == "" || srcReplicaAddress == "" {
@@ -1410,8 +1430,8 @@ func (e *Engine) ReplicaDelete(spdkClient *spdkclient.Client, replicaName, repli
 	defer e.Unlock()
 
 	if replicaName == "" {
-		for rName, rStatus := range e.ReplicaStatusMap {
-			if rStatus.Address == replicaAddress {
+		for rName, rStatus := range e.upstreams {
+			if rStatus.Address() == replicaAddress {
 				replicaName = rName
 				break
 			}
@@ -1420,21 +1440,21 @@ func (e *Engine) ReplicaDelete(spdkClient *spdkclient.Client, replicaName, repli
 	if replicaName == "" {
 		return fmt.Errorf("cannot find replica name with address %s for engine %s replica delete", replicaAddress, e.Name)
 	}
-	replicaStatus := e.ReplicaStatusMap[replicaName]
+	replicaStatus := e.upstreams[replicaName]
 	if replicaStatus == nil {
 		return fmt.Errorf("cannot find replica %s from the replica status map for engine %s replica delete", replicaName, e.Name)
 	}
-	if replicaAddress != "" && replicaStatus.Address != replicaAddress {
-		return fmt.Errorf("replica %s recorded address %s does not match the input address %s for engine %s replica delete", replicaName, replicaStatus.Address, replicaAddress, e.Name)
+	if replicaAddress != "" && replicaStatus.Address() != replicaAddress {
+		return fmt.Errorf("replica %s recorded address %s does not match the input address %s for engine %s replica delete", replicaName, replicaStatus.Address(), replicaAddress, e.Name)
 	}
 
-	e.log.Infof("Removing base bdev %v from engine", replicaStatus.BdevName)
-	if _, err := spdkClient.BdevRaidRemoveBaseBdev(replicaStatus.BdevName); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-		return errors.Wrapf(err, "failed to remove base bdev %s for deleting replica %s", replicaStatus.BdevName, replicaName)
+	e.log.Infof("Removing base bdev %v from engine", replicaStatus.BdevName())
+	if _, err := spdkClient.BdevRaidRemoveBaseBdev(replicaStatus.BdevName()); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+		return errors.Wrapf(err, "failed to remove base bdev %s for deleting replica %s", replicaStatus.BdevName(), replicaName)
 	}
 
-	controllerName := helperutil.GetNvmeControllerNameFromNamespaceName(replicaStatus.BdevName)
-	// Fallback to use replica name. Make sure there won't be a leftover controller even if somehow `replicaStatus.BdevName` has no record
+	controllerName := helperutil.GetNvmeControllerNameFromNamespaceName(replicaStatus.BdevName())
+	// Fallback to use replica name. Make sure there won't be a leftover controller even if somehow `replicaStatus.BdevName()` has no record
 	if controllerName == "" {
 		e.log.Infof("No NVMf controller found for replica %s, so fallback to use replica name %s", replicaName, replicaName)
 		controllerName = replicaName
@@ -1445,10 +1465,10 @@ func (e *Engine) ReplicaDelete(spdkClient *spdkclient.Client, replicaName, repli
 		return errors.Wrapf(err, "failed to detach controller %s for deleting replica %s", controllerName, replicaName)
 	}
 
-	delete(e.ReplicaStatusMap, replicaName)
+	delete(e.upstreams, replicaName)
 
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
-		"replicaStatusMap": e.ReplicaStatusMap,
+		"replicaStatusMap": e.upstreams,
 	}, "Failed to update logger with replica status map during engine creation")
 
 	return nil
@@ -1545,7 +1565,7 @@ func (e *Engine) snapshotOperation(spdkClient *spdkclient.Client, inputSnapshotN
 		}
 	}()
 
-	updateRequired, replicasErr, engineErr = e.snapshotOperationWithoutLock(spdkClient, replicaClients, snapshotName, snapshotOp, opts)
+	updateRequired, replicasErr, engineErr = e.snapshotOperationWithoutLock(spdkClient, snapshotName, snapshotOp, opts)
 	if replicasErr != nil {
 		return "", replicasErr
 	}
@@ -1562,14 +1582,14 @@ func (e *Engine) snapshotOperation(spdkClient *spdkclient.Client, inputSnapshotN
 
 func (e *Engine) getReplicaClients() (replicaClients map[string]*client.SPDKClient, err error) {
 	replicaClients = map[string]*client.SPDKClient{}
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		if replicaStatus.Mode != types.ModeRW && replicaStatus.Mode != types.ModeWO {
+	for replicaName, replicaStatus := range e.upstreams {
+		if replicaStatus.Mode() != types.ModeRW && replicaStatus.Mode() != types.ModeWO {
 			continue
 		}
-		if replicaStatus.Address == "" {
+		if replicaStatus.Address() == "" {
 			continue
 		}
-		c, err := GetServiceClient(replicaStatus.Address)
+		c, err := GetServiceClient(replicaStatus.Address())
 		if err != nil {
 			return nil, err
 		}
@@ -1609,14 +1629,14 @@ func (e *Engine) snapshotOperationPreCheckWithoutLock(replicaClients map[string]
 	}
 
 	for replicaName := range replicaClients {
-		replicaStatus := e.ReplicaStatusMap[replicaName]
+		replicaStatus := e.upstreams[replicaName]
 		if replicaStatus == nil {
 			return "", fmt.Errorf("cannot find replica %s in the engine %s replica status map before snapshot %s operation", replicaName, e.Name, snapshotName)
 		}
 		switch snapshotOp {
 		case SnapshotOperationCreate:
 		case SnapshotOperationDelete:
-			if replicaStatus.Mode == types.ModeWO {
+			if replicaStatus.Mode() == types.ModeWO {
 				return "", fmt.Errorf("engine %s contains WO replica %s during snapshot %s delete", e.Name, replicaName, snapshotName)
 			}
 		case SnapshotOperationRevert:
@@ -1626,23 +1646,23 @@ func (e *Engine) snapshotOperationPreCheckWithoutLock(replicaClients map[string]
 			if e.Frontend != types.FrontendEmpty {
 				return "", fmt.Errorf("invalid frontend %v for engine %s snapshot %s revert", e.Frontend, e.Name, snapshotName)
 			}
-			if replicaStatus.Mode == types.ModeWO {
+			if replicaStatus.Mode() == types.ModeWO {
 				return "", fmt.Errorf("engine %s contains WO replica %s during snapshot %s revert", e.Name, replicaName, snapshotName)
 			}
-			r, err := replicaClients[replicaName].ReplicaGet(replicaName)
+			view, err := replicaStatus.Get()
 			if err != nil {
 				return "", err
 			}
-			if r.Snapshots[snapshotName] == nil {
+			if view.Snapshots[snapshotName] == nil {
 				return "", fmt.Errorf("replica %s does not contain the reverting snapshot %s", replicaName, snapshotName)
 			}
 		case SnapshotOperationPurge:
-			if replicaStatus.Mode == types.ModeWO {
+			if replicaStatus.Mode() == types.ModeWO {
 				return "", fmt.Errorf("engine %s contains WO replica %s during snapshot purge", e.Name, replicaName)
 			}
 			// TODO: Do we need to verify that all replicas hold the same system snapshot list?
 		case SnapshotOperationHash:
-			if replicaStatus.Mode == types.ModeWO {
+			if replicaStatus.Mode() == types.ModeWO {
 				return "", fmt.Errorf("engine %s contains WO replica %s during snapshot hash", e.Name, replicaName)
 			}
 			// TODO: Do we need to verify that all replicas hold the same system snapshot list?
@@ -1654,7 +1674,7 @@ func (e *Engine) snapshotOperationPreCheckWithoutLock(replicaClients map[string]
 	return snapshotName, nil
 }
 
-func (e *Engine) snapshotOperationWithoutLock(spdkClient *spdkclient.Client, replicaClients map[string]*client.SPDKClient, snapshotName string, snapshotOp SnapshotOperationType, opts any) (updated bool, replicasErr error, engineErr error) {
+func (e *Engine) snapshotOperationWithoutLock(spdkClient *spdkclient.Client, snapshotName string, snapshotOp SnapshotOperationType, opts any) (updated bool, replicasErr error, engineErr error) {
 	if snapshotOp == SnapshotOperationRevert {
 		if _, err := spdkClient.BdevRaidDelete(e.Name); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
 			e.log.WithError(err).Errorf("Failed to delete RAID after snapshot %s revert", snapshotName)
@@ -1663,16 +1683,20 @@ func (e *Engine) snapshotOperationWithoutLock(spdkClient *spdkclient.Client, rep
 	}
 
 	replicaErrorList := []error{}
-	for replicaName := range replicaClients {
-		replicaStatus := e.ReplicaStatusMap[replicaName]
-		if replicaStatus == nil {
-			return false, fmt.Errorf("cannot find replica %s in the engine %s replica status map during snapshot %s operation", replicaName, e.Name, snapshotName), nil
+	for replicaName, replicaStatus := range e.upstreams {
+		// Match the filter the old getReplicaClients map applied: only
+		// dispatch to upstreams that are RW/WO and have a known address.
+		if replicaStatus.Mode() != types.ModeRW && replicaStatus.Mode() != types.ModeWO {
+			continue
 		}
-		if err := e.replicaSnapshotOperation(spdkClient, replicaClients[replicaName], replicaName, snapshotName, snapshotOp, opts); err != nil && replicaStatus.Mode != types.ModeERR {
+		if replicaStatus.Address() == "" {
+			continue
+		}
+		if err := e.replicaSnapshotOperation(spdkClient, replicaStatus, replicaName, snapshotName, snapshotOp, opts); err != nil && replicaStatus.Mode() != types.ModeERR {
 			replicaErrorList = append(replicaErrorList, err)
 			if snapshotOp != SnapshotOperationHash {
-				e.log.WithError(err).Errorf("Engine failed to issue operation %s for replica %s snapshot %s, will mark the replica mode from %v to ERR", snapshotOp, replicaName, snapshotName, replicaStatus.Mode)
-				replicaStatus.Mode = types.ModeERR
+				e.log.WithError(err).Errorf("Engine failed to issue operation %s for replica %s snapshot %s, will mark the replica mode from %v to ERR", snapshotOp, replicaName, snapshotName, replicaStatus.Mode())
+				replicaStatus.SetMode(types.ModeERR)
 				updated = true
 			}
 		}
@@ -1681,14 +1705,14 @@ func (e *Engine) snapshotOperationWithoutLock(spdkClient *spdkclient.Client, rep
 
 	if snapshotOp == SnapshotOperationRevert {
 		replicaBdevList := []string{}
-		for _, replicaStatus := range e.ReplicaStatusMap {
-			if replicaStatus.Mode != types.ModeRW {
+		for _, replicaStatus := range e.upstreams {
+			if replicaStatus.Mode() != types.ModeRW {
 				continue
 			}
-			if replicaStatus.BdevName == "" {
+			if replicaStatus.BdevName() == "" {
 				continue
 			}
-			replicaBdevList = append(replicaBdevList, replicaStatus.BdevName)
+			replicaBdevList = append(replicaBdevList, replicaStatus.BdevName())
 		}
 
 		engineErr = retrygo.Do(
@@ -1705,7 +1729,17 @@ func (e *Engine) snapshotOperationWithoutLock(spdkClient *spdkclient.Client, rep
 	return updated, replicasErr, engineErr
 }
 
-func (e *Engine) replicaSnapshotOperation(spdkClient *spdkclient.Client, replicaClient *client.SPDKClient, replicaName, snapshotName string, snapshotOp SnapshotOperationType, opts any) error {
+// replicaSnapshotOperation forwards a single per-upstream snapshot RPC
+// through the Upstream interface. replicaUpstream dispatches to
+// ReplicaSnapshot*; shardGroupUpstream dispatches to ShardGroupSnapshot*.
+// SnapshotHash returns Unimplemented for EC volumes (initial release).
+//
+// The Revert case still drives bdev-layer disconnect/reconnect via
+// spdkClient — that's local to the engine process and is not on the
+// Upstream interface. The cross-process lvol-side body (head delete +
+// clone + namespace swap) executes inside the upstream process via
+// replicaStatus.SnapshotRevert.
+func (e *Engine) replicaSnapshotOperation(spdkClient *spdkclient.Client, replicaStatus Upstream, replicaName, snapshotName string, snapshotOp SnapshotOperationType, opts any) error {
 	switch snapshotOp {
 	case SnapshotOperationCreate:
 		// TODO: execute `sync` for the NVMe initiator before snapshot start
@@ -1713,37 +1747,33 @@ func (e *Engine) replicaSnapshotOperation(spdkClient *spdkclient.Client, replica
 		if !ok {
 			return fmt.Errorf("invalid opts types %+v for snapshot create operation", opts)
 		}
-		return replicaClient.ReplicaSnapshotCreate(replicaName, snapshotName, optsPtr)
+		return replicaStatus.SnapshotCreate(snapshotName, optsPtr)
 	case SnapshotOperationDelete:
-		return replicaClient.ReplicaSnapshotDelete(replicaName, snapshotName)
+		return replicaStatus.SnapshotDelete(snapshotName)
 	case SnapshotOperationRevert:
-		replicaStatus := e.ReplicaStatusMap[replicaName]
-		if replicaStatus == nil {
-			return fmt.Errorf("cannot find replica %s in the engine %s replica status map during snapshot %s operation", replicaName, e.Name, snapshotName)
-		}
-		if err := disconnectNVMfBdev(spdkClient, replicaStatus.BdevName, disconnectMaxRetries, disconnectRetryInterval); err != nil {
+		if err := disconnectNVMfBdev(spdkClient, replicaStatus.BdevName(), disconnectMaxRetries, disconnectRetryInterval); err != nil {
 			return err
 		}
-		replicaStatus.BdevName = ""
+		replicaStatus.SetBdevName("")
 		// If the below step failed, the replica will be marked as ERR during ValidateAndUpdate.
-		if err := replicaClient.ReplicaSnapshotRevert(replicaName, snapshotName); err != nil {
+		if err := replicaStatus.SnapshotRevert(snapshotName); err != nil {
 			return err
 		}
-		bdevName, err := connectNVMfBdev(spdkClient, replicaName, replicaStatus.Address, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+		bdevName, err := connectNVMfBdev(spdkClient, replicaName, replicaStatus.Address(), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 		if err != nil {
 			return err
 		}
 		if bdevName != "" {
-			replicaStatus.BdevName = bdevName
+			replicaStatus.SetBdevName(bdevName)
 		}
 	case SnapshotOperationPurge:
-		return replicaClient.ReplicaSnapshotPurge(replicaName)
+		return replicaStatus.SnapshotPurge()
 	case SnapshotOperationHash:
 		rehash, ok := opts.(bool)
 		if !ok {
 			return fmt.Errorf("rehash should be a boolean value for snapshot hash operation")
 		}
-		if err := replicaClient.ReplicaSnapshotHash(replicaName, snapshotName, rehash); err != nil {
+		if err := replicaStatus.SnapshotHash(snapshotName, rehash); err != nil {
 			return err
 		}
 	default:
@@ -1761,16 +1791,16 @@ func (e *Engine) SnapshotHashStatus(snapshotName string) (*spdkrpc.EngineSnapsho
 	e.Lock()
 	defer e.Unlock()
 
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		if replicaStatus.Mode != types.ModeRW {
+	for replicaName, replicaStatus := range e.upstreams {
+		if replicaStatus.Mode() != types.ModeRW {
 			continue
 		}
 
-		replicaSnapshotHashStatusResponse, err := e.getReplicaSnapshotHashStatus(replicaName, replicaStatus.Address, snapshotName)
+		replicaSnapshotHashStatusResponse, err := e.getReplicaSnapshotHashStatus(replicaName, replicaStatus.Address(), snapshotName)
 		if err != nil {
 			return nil, err
 		}
-		resp.Status[replicaStatus.Address] = replicaSnapshotHashStatusResponse
+		resp.Status[replicaStatus.Address()] = replicaSnapshotHashStatusResponse
 	}
 
 	return resp, nil
@@ -1792,18 +1822,18 @@ func (e *Engine) SnapshotClone(snapshotName, srcEngineName, srcEngineAddress str
 
 	e.log.Infof("Engine is starting cloning snapshot %s", snapshotName)
 
-	if len(e.ReplicaStatusMap) != 1 {
+	if len(e.upstreams) != 1 {
 		return fmt.Errorf("destination engine must only have 1 replica when doing snapshot clone. Current "+
-			"replica count is %v", len(e.ReplicaStatusMap))
+			"replica count is %v", len(e.upstreams))
 	}
 
 	dstReplicaName, dstReplicaAddr := "", ""
-	for rName, rStatus := range e.ReplicaStatusMap {
-		if rStatus.Mode != types.ModeRW {
+	for rName, rStatus := range e.upstreams {
+		if rStatus.Mode() != types.ModeRW {
 			continue
 		}
 		dstReplicaName = rName
-		dstReplicaAddr = rStatus.Address
+		dstReplicaAddr = rStatus.Address()
 		break
 	}
 
@@ -1914,23 +1944,23 @@ func (e *Engine) ReplicaList(spdkClient *spdkclient.Client) (ret map[string]*api
 
 	replicas := map[string]*api.Replica{}
 
-	for name, replicaStatus := range e.ReplicaStatusMap {
-		replicaServiceCli, err := GetServiceClient(replicaStatus.Address)
+	for name, replicaStatus := range e.upstreams {
+		replicaServiceCli, err := GetServiceClient(replicaStatus.Address())
 		if err != nil {
-			e.log.WithError(err).Errorf("Failed to get service client for replica %s with address %s during list replicas", name, replicaStatus.Address)
+			e.log.WithError(err).Errorf("Failed to get service client for replica %s with address %s during list replicas", name, replicaStatus.Address())
 			continue
 		}
 
 		func() {
 			defer func() {
 				if errClose := replicaServiceCli.Close(); errClose != nil {
-					e.log.WithError(errClose).Errorf("Failed to close replica %s client with address %s during list replicas", name, replicaStatus.Address)
+					e.log.WithError(errClose).Errorf("Failed to close replica %s client with address %s during list replicas", name, replicaStatus.Address())
 				}
 			}()
 
 			replica, err := replicaServiceCli.ReplicaGet(name)
 			if err != nil {
-				e.log.WithError(err).Errorf("Failed to get replica %s with address %s", name, replicaStatus.Address)
+				e.log.WithError(err).Errorf("Failed to get replica %s with address %s", name, replicaStatus.Address())
 				return
 			}
 
@@ -1970,12 +2000,12 @@ func (e *Engine) BackupCreate(backupName, volumeName, engineName, snapshotName, 
 	}()
 
 	replicaName, replicaAddress := "", ""
-	for name, replicaStatus := range e.ReplicaStatusMap {
-		if replicaStatus.Mode != types.ModeRW {
+	for name, replicaStatus := range e.upstreams {
+		if replicaStatus.Mode() != types.ModeRW {
 			continue
 		}
 		replicaName = name
-		replicaAddress = replicaStatus.Address
+		replicaAddress = replicaStatus.Address()
 		break
 	}
 
@@ -2021,9 +2051,9 @@ func (e *Engine) BackupStatus(backupName, replicaAddress string) (*spdkrpc.Backu
 	defer e.Unlock()
 
 	found := false
-	for name, replicaStatus := range e.ReplicaStatusMap {
-		if replicaStatus.Address == replicaAddress {
-			if replicaStatus.Mode != types.ModeRW {
+	for name, replicaStatus := range e.upstreams {
+		if replicaStatus.Address() == replicaAddress {
+			if replicaStatus.Mode() != types.ModeRW {
 				return nil, grpcstatus.Errorf(grpccodes.Internal, "replica %s is not in RW mode", name)
 			}
 			found = true
@@ -2048,211 +2078,378 @@ func (e *Engine) BackupStatus(backupName, replicaAddress string) (*spdkrpc.Backu
 	return replicaServiceCli.ReplicaBackupStatus(backupName)
 }
 
-func (e *Engine) BackupRestore(spdkClient *spdkclient.Client, backupUrl, engineName, snapshotName string, credential map[string]string, concurrentLimit int32) (*spdkrpc.EngineBackupRestoreResponse, error) {
+// BackupRestore initiates a backup restore for the engine.
+// It returns a done channel that is closed when the restore goroutine completes
+// (whether successfully, with an error, or cancelled). Callers that set up a
+// temporary frontend connection should wait on this channel before tearing it down.
+func (e *Engine) BackupRestore(spdkClient *spdkclient.Client, backupUrl, endpoint string, credential map[string]string, concurrentLimit int32, superiorPortAllocator *commonbitmap.Bitmap) (resp *spdkrpc.EngineBackupRestoreResponse, doneCh <-chan struct{}, err error) {
 	e.log.Infof("Restoring backup %s", backupUrl)
+
+	resp = &spdkrpc.EngineBackupRestoreResponse{
+		Errors: map[string]string{},
+	}
+
+	e.Lock()
+	if err := e.precheckBackupRestore(backupUrl); err != nil {
+		e.Unlock()
+		return resp, nil, err
+	}
+	e.Unlock()
+
+	backupInfo, err := backupstore.InspectBackup(backupUrl)
+	if err != nil {
+		return resp, nil, err
+	}
 
 	e.Lock()
 	defer e.Unlock()
 
-	resp := &spdkrpc.EngineBackupRestoreResponse{
-		Errors: map[string]string{},
-	}
-
-	backupInfo, err := backupstore.InspectBackup(backupUrl)
-	if err != nil {
-		for _, replicaStatus := range e.ReplicaStatusMap {
-			resp.Errors[replicaStatus.Address] = err.Error()
-		}
-		return resp, nil
+	// need to recheck the backup restore precheck after inspecting the backup,
+	// because we release the lock during backup inspection which can take a long time, and the engine state may change when we reacquire the lock.
+	if err := e.precheckBackupRestore(backupUrl); err != nil {
+		return resp, nil, err
 	}
 
 	if backupInfo.VolumeSize != int64(e.SpecSize) {
-		return nil, fmt.Errorf("the backup volume %v size %v must be the same as the Longhorn volume size %v", backupInfo.VolumeName, backupInfo.VolumeSize, e.SpecSize)
+		return resp, nil, fmt.Errorf("the backup volume %v size %v must be the same as the Longhorn volume size %v", backupInfo.VolumeName, backupInfo.VolumeSize, e.SpecSize)
 	}
 
-	e.log.Infof("Deleting raid bdev %s before restoration", e.Name)
-	if _, err := spdkClient.BdevRaidDelete(e.Name); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-		return nil, errors.Wrapf(err, "failed to delete raid bdev %s before restoration", e.Name)
+	isFullRestore, err := e.backupRestorePrepare(spdkClient, backupUrl, credential, superiorPortAllocator)
+	if err != nil {
+		return resp, nil, err
 	}
 
-	e.log.Info("Disconnecting all replicas before restoration")
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		if err := disconnectNVMfBdev(spdkClient, replicaStatus.BdevName, disconnectMaxRetries, disconnectRetryInterval); err != nil {
-			e.log.Infof("Failed to remove replica %s before restoration", replicaName)
-			return nil, errors.Wrapf(err, "failed to remove replica %s before restoration", replicaName)
+	lastRestored := e.restore.LastRestored
+
+	defer func() {
+		if err != nil {
+			e.IsRestoring = false
 		}
-		replicaStatus.BdevName = ""
+	}()
+
+	// The frontend (NVMe-TCP initiator) is managed by EngineFrontend.
+	// Store the provided endpoint so EngineRestore.OpenVolumeDev can access the block device.
+	// Also copy it into e.restore.endpoint so OpenVolumeDev does not need to re-acquire the
+	// engine lock (which would deadlock — BackupRestore already holds e.Lock()).
+	e.log.Infof("Using endpoint %v for backup restore", endpoint)
+	e.restore.endpoint = endpoint
+
+	// Start the backup restore. The goroutine is launched only after these calls
+	// succeed so that a failure here does not leave completeBackupRestore blocked
+	// forever in waitForRestoreComplete (goroutine leak).
+	if isFullRestore {
+		e.log.Infof("Starting a new full restore for backup %v", backupUrl)
+		if err := e.backupRestore(backupUrl, concurrentLimit); err != nil {
+			return resp, nil, errors.Wrapf(err, "failed to start full backup restore")
+		}
+		e.log.Infof("Successfully initiated full restore for %v to %v", backupUrl, e.Name)
+	} else {
+		e.log.Infof("Starting an incremental restore for backup %v", backupUrl)
+		if err := e.backupRestoreIncrementally(backupUrl, lastRestored, concurrentLimit); err != nil {
+			return resp, nil, errors.Wrapf(err, "failed to start incremental backup restore")
+		}
+		e.log.Infof("Successfully initiated incremental restore for %v to %v", backupUrl, e.Name)
+	}
+
+	// ch is closed when completeBackupRestore finishes (success, error, or cancel).
+	// The caller (EngineFrontend) waits on this channel before tearing down the initiator.
+	ch := make(chan struct{})
+	go func() {
+		defer close(ch)
+		e.log.WithFields(logrus.Fields{
+			"snapshotName": backupInfo.SnapshotName,
+			"endpoint":     endpoint,
+		}).Info("Waiting for replica restore completion in background")
+		if err := e.completeBackupRestore(spdkClient, backupInfo.SnapshotName); err != nil {
+			e.log.WithError(err).Warn("Failed to complete backup restore")
+			return
+		}
+		e.log.WithField("snapshotName", backupInfo.SnapshotName).Info("Background backup restore completion finished")
+	}()
+
+	return resp, ch, nil
+}
+
+func (e *Engine) precheckBackupRestore(backupURL string) error {
+	if len(e.upstreams) == 0 {
+		return fmt.Errorf("cannot restore backup %s: no replicas available", backupURL)
+	}
+
+	for _, replicaStatus := range e.upstreams {
+		if replicaStatus.Mode() != types.ModeRW {
+			return fmt.Errorf("cannot restore backup %s: replica %s is in mode %v",
+				backupURL, replicaStatus.Address(), replicaStatus.Mode())
+		}
+	}
+
+	if e.IsRestoring {
+		return fmt.Errorf("%w", ErrRestoringInProgress)
+	}
+
+	return nil
+}
+
+func (e *Engine) backupRestorePrepare(spdkClient *spdkclient.Client, backupUrl string, credential map[string]string, superiorPortAllocator *commonbitmap.Bitmap) (isFullRestore bool, err error) {
+	backupType, err := butil.CheckBackupType(backupUrl)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to check backup type for %v", backupUrl)
+	}
+	if err = butil.SetupCredential(backupType, credential); err != nil {
+		return false, errors.Wrapf(err, "failed to setup credential for %v", backupUrl)
+	}
+
+	backupName, _, _, err := backupstore.DecodeBackupURL(util.UnescapeURL(backupUrl))
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to decode backup URL %v", backupUrl)
+	}
+
+	if e.restore == nil || e.restore.State == btypes.ProgressStateError || e.restore.State == btypes.ProgressStateCanceled {
+		e.restore = NewEngineRestore(spdkClient, backupUrl, backupName, e, superiorPortAllocator)
+	} else {
+		if e.restore.LastRestored == backupName {
+			return false, fmt.Errorf("already restored backup %v", backupName)
+		}
+		validLastRestoredBackup := e.canDoIncrementalRestore(e.restore, backupUrl, backupName)
+		e.restore.StartNewRestore(backupUrl, backupName, validLastRestoredBackup)
 	}
 
 	e.IsRestoring = true
+	e.log.WithFields(logrus.Fields{
+		"replicas":        len(e.upstreams),
+		"requestedBackup": backupUrl,
+		"lastRestored":    e.restore.LastRestored,
+	}).Info("Engine marked as restoring")
 
-	switch {
-	case snapshotName != "":
-		e.RestoringSnapshotName = snapshotName
-		e.log.Infof("Using input snapshot name %s for the restore", e.RestoringSnapshotName)
-	case len(e.SnapshotMap) == 0:
-		e.RestoringSnapshotName = util.UUID()
-		e.log.Infof("Using new generated snapshot name %s for the full restore", e.RestoringSnapshotName)
-	case e.RestoringSnapshotName != "":
-		e.log.Infof("Using existing snapshot name %s for the incremental restore", e.RestoringSnapshotName)
-	default:
-		e.RestoringSnapshotName = util.UUID()
-		e.log.Infof("Using new generated snapshot name %s for the incremental restore because e.FinalSnapshotName is empty", e.RestoringSnapshotName)
-	}
-
-	defer func() {
-		go func() {
-			if err := e.completeBackupRestore(spdkClient); err != nil {
-				e.log.WithError(err).Warn("Failed to complete backup restore")
-			}
-		}()
-	}()
-
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		e.log.Infof("Restoring backup on replica %s address %s", replicaName, replicaStatus.Address)
-
-		replicaServiceCli, err := GetServiceClient(replicaStatus.Address)
-		if err != nil {
-			e.log.WithError(err).Errorf("Failed to restore backup on replica %s with address %s", replicaName, replicaStatus.Address)
-			resp.Errors[replicaStatus.Address] = err.Error()
-			continue
-		}
-
-		func() {
-			defer func() {
-				if errClose := replicaServiceCli.Close(); errClose != nil {
-					e.log.WithError(errClose).Errorf("Failed to close replica %s client with address %s during restore backup", replicaName, replicaStatus.Address)
-				}
-			}()
-
-			err = replicaServiceCli.ReplicaBackupRestore(&client.BackupRestoreRequest{
-				BackupUrl:       backupUrl,
-				ReplicaName:     replicaName,
-				SnapshotName:    e.RestoringSnapshotName,
-				Credential:      credential,
-				ConcurrentLimit: concurrentLimit,
-			})
-			if err != nil {
-				e.log.WithError(err).Errorf("Failed to restore backup on replica %s address %s", replicaName, replicaStatus.Address)
-				resp.Errors[replicaStatus.Address] = err.Error()
-			}
-		}()
-	}
-
-	return resp, nil
+	isFullRestore = e.restore.LastRestored == ""
+	return isFullRestore, nil
 }
 
-func (e *Engine) completeBackupRestore(spdkClient *spdkclient.Client) error {
-	if err := e.waitForRestoreComplete(); err != nil {
-		return errors.Wrapf(err, "failed to wait for restore complete")
+func (e *Engine) canDoIncrementalRestore(restore *EngineRestore, backupURL, requestedBackupName string) bool {
+	if restore.LastRestored == "" {
+		e.log.Warnf("There is a restore record but last restored backup is empty with restore state %v, will do full restore instead", restore.State)
+		return false
+	}
+	if _, err := backupstore.InspectBackup(strings.Replace(backupURL, requestedBackupName, restore.LastRestored, 1)); err != nil {
+		e.log.WithError(err).Warnf("The last restored backup %v becomes invalid for incremental restore, will do full restore instead", restore.LastRestored)
+		return false
+	}
+	return true
+}
+
+func (e *Engine) backupRestore(backupURL string, concurrentLimit int32) error {
+	backupURL = butil.UnescapeURL(backupURL)
+
+	e.log.WithFields(logrus.Fields{
+		"backupURL":       backupURL,
+		"concurrentLimit": concurrentLimit,
+	}).Info("Starting full backup restore")
+
+	return backupstore.RestoreDeltaBlockBackup(e.ctx, &backupstore.DeltaRestoreConfig{
+		BackupURL:       backupURL,
+		DeltaOps:        e.restore,
+		Filename:        "",
+		ConcurrentLimit: concurrentLimit,
+	})
+}
+
+func (e *Engine) backupRestoreIncrementally(backupURL, lastRestored string, concurrentLimit int32) error {
+	backupURL = butil.UnescapeURL(backupURL)
+
+	e.log.WithFields(logrus.Fields{
+		"backupURL":       backupURL,
+		"lastRestored":    lastRestored,
+		"concurrentLimit": concurrentLimit,
+	}).Info("Starting incremental backup restore")
+
+	return backupstore.RestoreDeltaBlockBackupIncrementally(e.ctx, &backupstore.DeltaRestoreConfig{
+		BackupURL:       backupURL,
+		DeltaOps:        e.restore,
+		LastBackupName:  lastRestored,
+		Filename:        "",
+		ConcurrentLimit: concurrentLimit,
+	})
+}
+
+func (e *Engine) completeBackupRestore(spdkClient *spdkclient.Client, backupSnapshotName string) (err error) {
+	// waitForRestoreComplete only reads e.restore fields under e.restore.RLock;
+	// no engine lock is needed (and must not be held — SnapshotCreate/Delete acquire it).
+	waitErr := e.waitForRestoreComplete()
+
+	// Acquire the engine lock to mutate shared fields and tear down the temporary
+	// NVMe-TCP target. This runs regardless of success or failure so that the target
+	// is always stopped and the port always released.
+	// The EngineFrontend initiator is still connected at this point;
+	// it will be torn down after doneCh is closed (i.e. after this function returns).
+	e.Lock()
+	e.log.Infof("Finalizing backup restore state")
+
+	if !e.IsRestoring {
+		e.Unlock()
+		return fmt.Errorf("BUG: engine is not being restored")
 	}
 
-	return e.BackupRestoreFinish(spdkClient)
+	isCanceled := e.restore != nil && e.restore.State == btypes.ProgressStateCanceled
+
+	// Snapshot name recorded by a previous restore cycle (used below once the lock is dropped).
+	oldSnapshotName := ""
+	if e.restore != nil {
+		oldSnapshotName = e.restore.SnapshotName
+	}
+
+	// Stop the temporary NVMe-TCP target and release its port.
+	if e.Frontend == types.FrontendEmpty {
+		e.cleanupTemporaryNvmeTcpTargetForRestoreLocked(spdkClient, e.restore.superiorPortAllocator, "backup restore completion")
+	}
+
+	e.Unlock()
+
+	if waitErr != nil {
+		e.Lock()
+		e.IsRestoring = false
+		if e.restore != nil {
+			e.restore.UpdateRestoreStatus(e.restore.SnapshotName, 0, waitErr)
+		}
+		e.Unlock()
+		return errors.Wrapf(waitErr, "failed to wait for engine restore complete")
+	}
+
+	// Finalize restore state under the engine lock after snapshot operations complete.
+	defer func() {
+		e.Lock()
+		e.IsRestoring = false
+		if e.restore != nil {
+			if err != nil {
+				e.restore.UpdateRestoreStatus(e.restore.SnapshotName, 0, err)
+			} else {
+				e.restore.FinishRestore()
+			}
+		}
+		e.Unlock()
+	}()
+
+	if isCanceled {
+		e.log.Info("Doing nothing for canceled backup restoration")
+		return nil
+	}
+
+	// Delete previous snapshot after restore if it exists.
+	// SnapshotDelete acquires e.Lock() internally.
+	if oldSnapshotName != "" {
+		e.RLock()
+		_, snapshotExists := e.SnapshotMap[oldSnapshotName]
+		e.RUnlock()
+		if snapshotExists {
+			e.log.Infof("Deleting existing snapshot %v of the restored volume", oldSnapshotName)
+			if delErr := e.SnapshotDelete(spdkClient, oldSnapshotName); delErr != nil {
+				e.log.WithError(delErr).Warnf("Failed to delete existing snapshot %v of the restored volume", oldSnapshotName)
+			}
+		}
+	}
+
+	// Prefer using the backup source snapshot name for better traceability.
+	// Fall back to a UUID-based name if it is not available.
+	// SnapshotCreate acquires e.Lock() internally.
+	var newSnapshotName string
+	if backupSnapshotName == "" {
+		newSnapshotName = fmt.Sprintf("restore-%s", util.UUID())
+	} else {
+		newSnapshotName = fmt.Sprintf("restore-%s", backupSnapshotName)
+
+		// Avoid conflict if the snapshot already exists.
+		e.RLock()
+		_, exists := e.SnapshotMap[newSnapshotName]
+		e.RUnlock()
+		if exists {
+			suffix := util.UUID()[:5]
+			e.log.Warnf("Snapshot %v already exists, generating a unique restored snapshot name", newSnapshotName)
+			newSnapshotName = fmt.Sprintf("restore-%s-%s", backupSnapshotName, suffix)
+		}
+	}
+
+	e.log.Infof("Creating snapshot %v for the restored volume", newSnapshotName)
+	if _, createErr := e.SnapshotCreate(spdkClient, newSnapshotName); createErr != nil {
+		e.log.WithError(createErr).Warnf("Failed to create snapshot %v for the restored volume", newSnapshotName)
+	}
+
+	e.restore.Lock()
+	e.restore.SnapshotName = newSnapshotName
+	e.restore.Unlock()
+	e.log.Infof("Successfully created restored snapshot %v", newSnapshotName)
+
+	return nil
+}
+
+func (e *Engine) cleanupTemporaryNvmeTcpTargetForRestore(spdkClient *spdkclient.Client, superiorPortAllocator *commonbitmap.Bitmap, reason string) {
+	e.Lock()
+	defer e.Unlock()
+	e.cleanupTemporaryNvmeTcpTargetForRestoreLocked(spdkClient, superiorPortAllocator, reason)
+}
+
+func (e *Engine) cleanupTemporaryNvmeTcpTargetForRestoreLocked(spdkClient *spdkclient.Client, superiorPortAllocator *commonbitmap.Bitmap, reason string) {
+	if e.Frontend != types.FrontendEmpty || e.NvmeTcpTarget == nil {
+		return
+	}
+
+	if e.NvmeTcpTarget.Nqn != "" {
+		e.log.Infof("Cleaning up temporary NVMe-TCP target %s after %s", e.NvmeTcpTarget.Nqn, reason)
+		if stopErr := spdkClient.StopExposeBdev(e.NvmeTcpTarget.Nqn); stopErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(stopErr) {
+			e.log.WithError(stopErr).Warnf("Failed to stop exposing bdev during %s", reason)
+		}
+	}
+
+	e.NvmeTcpTarget.Nqn = ""
+	e.NvmeTcpTarget.Nguid = ""
+	e.NvmeTcpTarget.IP = ""
+	if relErr := e.releasePorts(superiorPortAllocator); relErr != nil {
+		e.log.WithError(relErr).Warnf("Failed to release ports during %s", reason)
+	}
 }
 
 func (e *Engine) waitForRestoreComplete() error {
-	periodicChecker := time.NewTicker(time.Duration(restorePeriodicRefreshInterval.Seconds()) * time.Second)
-	defer periodicChecker.Stop()
+	e.log.WithFields(logrus.Fields{
+		"interval":     restorePeriodicRefreshInterval.String(),
+		"snapshotName": e.RestoringSnapshotName,
+	}).Info("Waiting for restore to complete")
 
-	var err error
-	for range periodicChecker.C {
-		isReplicaRestoreCompleted := true
-		for replicaName, replicaStatus := range e.ReplicaStatusMap {
-			if replicaStatus.Mode != types.ModeRW {
-				continue
+	err := retrygo.Do(
+		func() error {
+			e.restore.RLock()
+			restoreProgress := e.restore.Progress
+			restoreError := e.restore.Error
+			restoreState := e.restore.State
+			e.restore.RUnlock()
+
+			if restoreState == btypes.ProgressStateCanceled {
+				return retrygo.Unrecoverable(fmt.Errorf("%v", btypes.ErrorMsgRestoreCancelled))
+			}
+			if restoreProgress == 100 {
+				e.log.Infof("Backup restore is done: %v%%", restoreProgress)
+				return nil
 			}
 
-			isReplicaRestoreCompleted, err = e.isReplicaRestoreCompleted(replicaName, replicaStatus.Address)
-			if err != nil {
-				return errors.Wrapf(err, "failed to check replica %s restore status", replicaName)
+			e.log.WithFields(logrus.Fields{
+				"progress":     restoreProgress,
+				"state":        restoreState,
+				"snapshotName": e.RestoringSnapshotName,
+			}).Debug("Restore is still in progress")
+
+			if restoreError != "" {
+				err := fmt.Errorf("%v", restoreError)
+				e.log.WithError(err).Error("Found backup restoration error")
+				return retrygo.Unrecoverable(err)
 			}
 
-			if !isReplicaRestoreCompleted {
-				break
-			}
-		}
+			return fmt.Errorf("restore is still in progress")
+		},
+		retrygo.Delay(restorePeriodicRefreshInterval),
+		retrygo.MaxDelay(restorePeriodicRefreshInterval),
+		retrygo.DelayType(retrygo.FixedDelay),
+		retrygo.Attempts(0), // retry forever until success or unrecoverable error
+	)
 
-		if isReplicaRestoreCompleted {
-			e.log.Info("Backup restoration completed successfully")
-			return nil
-		}
-	}
-
-	return errors.Errorf("failed to wait for engine %s restore complete", e.Name)
-}
-
-func (e *Engine) isReplicaRestoreCompleted(replicaName, replicaAddress string) (bool, error) {
-	log := e.log.WithFields(logrus.Fields{
-		"replica": replicaName,
-		"address": replicaAddress,
-	})
-	log.Trace("Checking replica restore status")
-
-	replicaServiceCli, err := GetServiceClient(replicaAddress)
 	if err != nil {
-		return false, errors.Wrapf(err, "failed to get replica %v service client %s", replicaName, replicaAddress)
+		return err
 	}
-	defer func() {
-		if errClose := replicaServiceCli.Close(); errClose != nil {
-			log.WithError(errClose).Errorf("Failed to close replica %s client with address %s during check restore status", replicaName, replicaAddress)
-		}
-	}()
-
-	status, err := replicaServiceCli.ReplicaRestoreStatus(replicaName)
-	if err != nil {
-		return false, errors.Wrapf(err, "failed to check replica %s restore status", replicaName)
-	}
-
-	return !status.IsRestoring, nil
-}
-
-func (e *Engine) BackupRestoreFinish(spdkClient *spdkclient.Client) error {
-	updateRequired := false
-
-	e.Lock()
-	defer func() {
-		e.Unlock()
-		if updateRequired {
-			e.UpdateCh <- nil
-		}
-	}()
-
-	replicaBdevList := []string{}
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		replicaAddress := replicaStatus.Address
-		replicaIP, replicaPort, err := net.SplitHostPort(replicaAddress)
-		if err != nil {
-			return err
-		}
-		e.log.Infof("Attaching replica %s with address %s before finishing restoration", replicaName, replicaAddress)
-		nvmeBdevNameList, err := spdkClient.BdevNvmeAttachController(replicaName, helpertypes.GetNQN(replicaName), replicaIP, replicaPort,
-			spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
-			int32(e.ctrlrLossTimeout), replicaReconnectDelaySec, int32(e.fastIOFailTimeoutSec), replicaMultipath)
-		if err != nil {
-			return err
-		}
-
-		if len(nvmeBdevNameList) != 1 {
-			return fmt.Errorf("got unexpected nvme bdev list %v", nvmeBdevNameList)
-		}
-
-		replicaStatus.BdevName = nvmeBdevNameList[0]
-		replicaStatus.Mode = types.ModeRW
-
-		replicaBdevList = append(replicaBdevList, replicaStatus.BdevName)
-	}
-
-	e.log.Infof("Creating raid bdev %s with replicas %+v before finishing restoration", e.Name, replicaBdevList)
-	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, ""); err != nil {
-		if !jsonrpc.IsJSONRPCRespErrorFileExists(err) {
-			e.log.WithError(err).Errorf("Failed to create raid bdev before finishing restoration")
-			return err
-		}
-	}
-
-	e.IsRestoring = false
-	e.checkAndUpdateInfoFromReplicasNoLock()
-	updateRequired = true
 
 	return nil
 }
@@ -2262,41 +2459,44 @@ func (e *Engine) RestoreStatus() (*spdkrpc.RestoreStatusResponse, error) {
 		Status: map[string]*spdkrpc.ReplicaRestoreStatusResponse{},
 	}
 
-	e.Lock()
-	defer e.Unlock()
+	e.RLock()
+	defer e.RUnlock()
 
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		if replicaStatus.Mode != types.ModeRW {
-			continue
+	if e.restore == nil {
+		for replicaName, replicaStatus := range e.upstreams {
+			resp.Status[replicaStatus.Address()] = &spdkrpc.ReplicaRestoreStatusResponse{
+				ReplicaName:    replicaName,
+				ReplicaAddress: GetBackendReplicaURL(replicaStatus.Address()),
+				IsRestoring:    false,
+			}
 		}
+		return resp, nil
+	}
 
-		restoreStatus, err := e.getReplicaRestoreStatus(replicaName, replicaStatus.Address)
-		if err != nil {
-			return nil, err
+	e.restore.RLock()
+	restoreProgress := e.restore.Progress
+	restoreError := e.restore.Error
+	restoreState := e.restore.State
+	lastRestored := e.restore.LastRestored
+	currentRestoringBackup := e.restore.CurrentRestoringBackup
+	backupURL := e.restore.BackupURL
+	e.restore.RUnlock()
+
+	for replicaName, replicaStatus := range e.upstreams {
+		resp.Status[replicaStatus.Address()] = &spdkrpc.ReplicaRestoreStatusResponse{
+			ReplicaName:            replicaName,
+			ReplicaAddress:         GetBackendReplicaURL(replicaStatus.Address()),
+			IsRestoring:            e.IsRestoring,
+			LastRestored:           lastRestored,
+			Progress:               int32(restoreProgress),
+			Error:                  restoreError,
+			State:                  string(restoreState),
+			BackupUrl:              backupURL,
+			CurrentRestoringBackup: currentRestoringBackup,
 		}
-		resp.Status[replicaStatus.Address] = restoreStatus
 	}
 
 	return resp, nil
-}
-
-func (e *Engine) getReplicaRestoreStatus(replicaName, replicaAddress string) (*spdkrpc.ReplicaRestoreStatusResponse, error) {
-	replicaServiceCli, err := GetServiceClient(replicaAddress)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if errClose := replicaServiceCli.Close(); errClose != nil {
-			e.log.WithError(errClose).Errorf("Failed to close replica client with address %s during get restore status", replicaAddress)
-		}
-	}()
-
-	status, err := replicaServiceCli.ReplicaRestoreStatus(replicaName)
-	if err != nil {
-		return nil, err
-	}
-
-	return status, nil
 }
 
 // Expand performs an online volume expansion for the Longhorn Engine using SPDK.
@@ -2415,6 +2615,86 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 	return expandErr
 }
 
+// ExpandViaAEN expands the engine by waiting for SPDK's BDEV_EVENT_RESIZE
+// AEN chain to grow the engine's bdev_raid1 in response to the upstream
+// resize. The engine performs no SPDK call beyond polling the raid bdev's
+// blockcnt: when an upstream lvol resizes, the NVMe-oF target fires
+// AER_NS_ATTR_CHANGED, the engine's bdev_nvme initiator detects the new
+// namespace size, and raid1_resize fires automatically (see
+// lep.md "Expand transitional state" and module/bdev/raid/raid1.c:504).
+//
+// This is the path used for EC volumes: ShardGroupController already drove
+// ShardExpand + ShardGroupExpand against the ShardGroup process, so by the
+// time EngineExpand arrives the upstream lvol has been resized and the AEN
+// is in flight (or already delivered). RAID1 still uses the tear-down/
+// expand-replicas/reconstruct cycle in Engine.Expand; both layouts are
+// expected to converge on this method once the AEN chain is verified
+// reliable on the SPDK build the branch ships against.
+func (e *Engine) ExpandViaAEN(spdkClient *spdkclient.Client, size uint64) (err error) {
+	const (
+		pollInterval = 500 * time.Millisecond
+		pollTimeout  = 60 * time.Second
+	)
+
+	e.Lock()
+	originalSize := e.SpecSize
+
+	if e.IsRestoring {
+		e.Unlock()
+		return fmt.Errorf("%w", ErrRestoringInProgress)
+	}
+	if e.isExpanding {
+		e.Unlock()
+		return fmt.Errorf("%w", ErrExpansionInProgress)
+	}
+
+	if e.SpecSize > size {
+		e.Unlock()
+		return fmt.Errorf("%w: cannot expand engine %s to a smaller size %v, current spec size %v",
+			ErrExpansionInvalidSize, e.Name, size, e.SpecSize)
+	}
+	if e.SpecSize == size {
+		// No-op: already at requested size, e.g. a retried EngineExpand
+		// after the AEN chain grew the raid bdev on a prior call.
+		e.lastExpansionError = ""
+		e.lastExpansionFailedAt = ""
+		e.Unlock()
+		return nil
+	}
+
+	e.isExpanding = true
+	e.lastExpansionFailedAt = ""
+	e.lastExpansionError = ""
+	defer e.Unlock()
+
+	e.log.Infof("Expanding engine via AEN-driven raid1 resize from size %v to %v", originalSize, size)
+
+	defer func() {
+		e.isExpanding = false
+		e.finishExpansion(originalSize, size, err)
+	}()
+
+	deadline := time.Now().Add(pollTimeout)
+	for {
+		bdevRaid, getErr := spdkClient.BdevRaidGet(e.Name, 0)
+		if getErr != nil {
+			return errors.Wrapf(getErr, "failed to get raid bdev %s during AEN-driven expand", e.Name)
+		}
+		if len(bdevRaid) == 0 {
+			return fmt.Errorf("raid bdev %s not found during AEN-driven expand", e.Name)
+		}
+		currentSize := bdevRaid[0].NumBlocks * uint64(bdevRaid[0].BlockSize)
+		if currentSize >= size {
+			e.log.Infof("Engine raid bdev %s reached size %v >= requested %v after AEN-driven resize", e.Name, currentSize, size)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for raid bdev %s to reach size %v via AEN (current %v)", e.Name, size, currentSize)
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
 func (e *Engine) finishExpansion(fromSize, toSize uint64, err error) {
 	if err != nil {
 		e.SpecSize = fromSize
@@ -2519,7 +2799,7 @@ func (e *Engine) expandReplicas(spdkClient *spdkclient.Client, replicaClients ma
 }
 
 func (e *Engine) expandSingleReplica(spdkClient *spdkclient.Client, replicaName string, replicaClient *client.SPDKClient, size uint64) error {
-	replicaStatus, ok := e.ReplicaStatusMap[replicaName]
+	replicaStatus, ok := e.upstreams[replicaName]
 	if !ok {
 		e.log.WithField("replica", replicaName).Warn("Replica not found in status map")
 		return nil
@@ -2534,7 +2814,7 @@ func (e *Engine) expandSingleReplica(spdkClient *spdkclient.Client, replicaName 
 		return nil
 	}
 
-	if err := disconnectNVMfBdev(spdkClient, replicaStatus.BdevName, disconnectMaxRetries, disconnectRetryInterval); err != nil {
+	if err := disconnectNVMfBdev(spdkClient, replicaStatus.BdevName(), disconnectMaxRetries, disconnectRetryInterval); err != nil {
 		return err
 	}
 
@@ -2542,7 +2822,7 @@ func (e *Engine) expandSingleReplica(spdkClient *spdkclient.Client, replicaName 
 		return err
 	}
 
-	_, err = connectNVMfBdev(spdkClient, replicaName, replicaStatus.Address, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+	_, err = connectNVMfBdev(spdkClient, replicaName, replicaStatus.Address(), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 	return err
 }
 
@@ -2577,8 +2857,8 @@ func aggregateReplicaErrors(failed map[string]error) map[string]string {
 
 func (e *Engine) markReplicasERR(failed map[string]error) {
 	for replicaName := range failed {
-		if status, ok := e.ReplicaStatusMap[replicaName]; ok {
-			status.Mode = types.ModeERR
+		if status, ok := e.upstreams[replicaName]; ok {
+			status.SetMode(types.ModeERR)
 		}
 	}
 }
@@ -2592,14 +2872,14 @@ func (e *Engine) reconstructRaidBdev(spdkClient *spdkclient.Client, bdevRaidUUID
 
 	// create the same name of raid bdev
 	replicaBdevList := []string{}
-	for _, replicaStatus := range e.ReplicaStatusMap {
-		if replicaStatus.Mode != types.ModeRW {
+	for _, replicaStatus := range e.upstreams {
+		if replicaStatus.Mode() != types.ModeRW {
 			continue
 		}
-		if replicaStatus.BdevName == "" {
+		if replicaStatus.BdevName() == "" {
 			continue
 		}
-		replicaBdevList = append(replicaBdevList, replicaStatus.BdevName)
+		replicaBdevList = append(replicaBdevList, replicaStatus.BdevName())
 	}
 	if len(replicaBdevList) == 0 {
 		return fmt.Errorf("no healthy replica bdevs available for RAID creation")
@@ -2650,41 +2930,31 @@ func (e *Engine) ExpandPrecheck(spdkClient *spdkclient.Client, size uint64) (req
 		}
 	}()
 
-	replicaClients, err := e.getReplicaClients()
-	if err != nil {
-		return false, errors.Wrapf(err, "failed to get replica clients")
-	}
-	defer e.closeReplicaClients(replicaClients)
-
 	// Ensure all replicas are in RW mode and have the same size
-	if len(e.ReplicaStatusMap) == 0 {
+	if len(e.upstreams) == 0 {
 		return false, fmt.Errorf("cannot expand engine with no replica")
 	}
 
 	currentReplicaSize := uint64(0)
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
+	for replicaName, replicaStatus := range e.upstreams {
 		e.log.Infof("Checking replica %s status", replicaName)
-		if replicaStatus.Mode != types.ModeRW {
-			return false, fmt.Errorf("cannot expand engine with replica %s in mode %v", replicaName, replicaStatus.Mode)
+		if replicaStatus.Mode() != types.ModeRW {
+			return false, fmt.Errorf("cannot expand engine with replica %s in mode %v", replicaName, replicaStatus.Mode())
 		}
 
-		replicaClient, ok := replicaClients[replicaName]
-		if !ok {
-			return false, fmt.Errorf("cannot find client for replica %s", replicaName)
-		}
-		replica, err := replicaClient.ReplicaGet(replicaName)
+		view, err := replicaStatus.Get()
 		if err != nil {
-			return false, errors.Wrapf(err, "cannot get replica %s before expansion", replicaName)
+			return false, errors.Wrapf(err, "cannot get upstream %s before expansion", replicaName)
 		}
 
 		if currentReplicaSize == 0 {
-			currentReplicaSize = replica.SpecSize
+			currentReplicaSize = view.SpecSize
 			continue
 		}
 
-		if currentReplicaSize != replica.SpecSize {
+		if currentReplicaSize != view.SpecSize {
 			return false, fmt.Errorf("cannot expand engine with replicas in different sizes: replica %s has size %v while other replicas have size %v",
-				replicaName, replica.SpecSize, currentReplicaSize)
+				replicaName, view.SpecSize, currentReplicaSize)
 		}
 	}
 
@@ -2737,7 +3007,7 @@ func (e *Engine) ValidateAndUpdate(spdkClient *spdkclient.Client) (err error) {
 	containValidReplica := e.validateReplicaStatusMapNoLock(bdevMap, &updateRequired)
 
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
-		"replicaStatusMap": e.ReplicaStatusMap,
+		"replicaStatusMap": e.upstreams,
 	}, "Failed to update logger with replica status map during engine creation")
 
 	if !containValidReplica {
@@ -2826,35 +3096,35 @@ func (e *Engine) validateAndMaybeAdjustSpecSizeNoLock(bdevRaid *spdktypes.BdevIn
 func (e *Engine) validateReplicaStatusMapNoLock(bdevMap map[string]*spdktypes.BdevInfo, updateRequired *bool) bool {
 	containValidReplica := false
 
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		if replicaStatus.Address == "" || replicaStatus.BdevName == "" {
-			if replicaStatus.Mode != types.ModeERR {
-				e.log.Errorf("Engine marked replica %s mode from %v to ERR since its address %s or bdev name %s is empty during ValidateAndUpdate", replicaName, replicaStatus.Mode, replicaStatus.Address, replicaStatus.BdevName)
-				replicaStatus.Mode = types.ModeERR
+	for replicaName, replicaStatus := range e.upstreams {
+		if replicaStatus.Address() == "" || replicaStatus.BdevName() == "" {
+			if replicaStatus.Mode() != types.ModeERR {
+				e.log.Errorf("Engine marked replica %s mode from %v to ERR since its address %s or bdev name %s is empty during ValidateAndUpdate", replicaName, replicaStatus.Mode(), replicaStatus.Address(), replicaStatus.BdevName())
+				replicaStatus.SetMode(types.ModeERR)
 				*updateRequired = true
 			}
 		}
 
-		if replicaStatus.Mode != types.ModeRW && replicaStatus.Mode != types.ModeWO && replicaStatus.Mode != types.ModeERR {
-			e.log.Errorf("Engine found replica %s invalid mode %v during ValidateAndUpdate", replicaName, replicaStatus.Mode)
-			replicaStatus.Mode = types.ModeERR
+		if replicaStatus.Mode() != types.ModeRW && replicaStatus.Mode() != types.ModeWO && replicaStatus.Mode() != types.ModeERR {
+			e.log.Errorf("Engine found replica %s invalid mode %v during ValidateAndUpdate", replicaName, replicaStatus.Mode())
+			replicaStatus.SetMode(types.ModeERR)
 			*updateRequired = true
 		}
 
-		if replicaStatus.Mode != types.ModeERR {
-			e.log.Debugf("Engine validating replica %s with bdev name %s and address %s during ValidateAndUpdate", replicaName, replicaStatus.BdevName, replicaStatus.Address)
-			mode, err := e.validateAndUpdateReplicaNvme(replicaName, bdevMap[replicaStatus.BdevName])
+		if replicaStatus.Mode() != types.ModeERR {
+			e.log.Debugf("Engine validating replica %s with bdev name %s and address %s during ValidateAndUpdate", replicaName, replicaStatus.BdevName(), replicaStatus.Address())
+			mode, err := e.validateAndUpdateReplicaNvme(replicaName, bdevMap[replicaStatus.BdevName()])
 			if err != nil {
-				e.log.WithError(err).Errorf("Engine found valid NVMe for replica %v, will update the mode from %s to ERR during ValidateAndUpdate", replicaName, replicaStatus.Mode)
-				replicaStatus.Mode = types.ModeERR
+				e.log.WithError(err).Errorf("Engine found valid NVMe for replica %v, will update the mode from %s to ERR during ValidateAndUpdate", replicaName, replicaStatus.Mode())
+				replicaStatus.SetMode(types.ModeERR)
 				*updateRequired = true
-			} else if replicaStatus.Mode != mode {
-				replicaStatus.Mode = mode
+			} else if replicaStatus.Mode() != mode {
+				replicaStatus.SetMode(mode)
 				*updateRequired = true
 			}
 		}
 
-		if replicaStatus.Mode == types.ModeRW {
+		if replicaStatus.Mode() == types.ModeRW {
 			containValidReplica = true
 		}
 	}
@@ -2863,23 +3133,23 @@ func (e *Engine) validateReplicaStatusMapNoLock(bdevMap map[string]*spdktypes.Bd
 }
 
 type replicaInspection struct {
-	replica           *api.Replica
+	view              *UpstreamView
 	ancestor          *api.Lvol
 	foundBackingImage bool
 	foundSnapshot     bool
 }
 
 // checkAndUpdateInfoFromReplicasNoLock refreshes engine-level info (SnapshotMap, Head,
-// ActualSize) from the replicas. It iterates ReplicaStatusMap, inspects each RW/WO
+// ActualSize) from the replicas. It iterates upstreams, inspects each RW/WO
 // replica, resolves its ancestor lineage, and selects the replica with the earliest
 // ancestor CreationTime as the info source. Must be called with the Engine lock held.
 func (e *Engine) checkAndUpdateInfoFromReplicasNoLock() {
-	replicaMap := map[string]*api.Replica{}
+	replicaViewMap := map[string]*UpstreamView{}
 	replicaAncestorMap := map[string]*api.Lvol{}
 	hasBackingImage := false
 	hasSnapshot := false
 
-	for replicaName, replicaStatus := range e.ReplicaStatusMap {
+	for replicaName, replicaStatus := range e.upstreams {
 		if !e.ensureReplicaModeForInfoUpdate(replicaName, replicaStatus) {
 			continue
 		}
@@ -2896,68 +3166,57 @@ func (e *Engine) checkAndUpdateInfoFromReplicasNoLock() {
 			hasSnapshot = true
 		}
 
-		replicaMap[replicaName] = inspection.replica
+		replicaViewMap[replicaName] = inspection.view
 		replicaAncestorMap[replicaName] = inspection.ancestor
 	}
 
-	e.selectAndApplyEarliestReplicaInfo(replicaMap, replicaAncestorMap, hasBackingImage, hasSnapshot)
+	e.selectAndApplyEarliestReplicaInfo(replicaViewMap, replicaAncestorMap, hasBackingImage, hasSnapshot)
 }
 
 // ensureReplicaModeForInfoUpdate checks whether a replica's mode qualifies it
 // for info update inspection. Returns true for RW and WO replicas. For any
 // unexpected mode (not RW, WO, or ERR), it downgrades the mode to ERR and
 // returns false.
-func (e *Engine) ensureReplicaModeForInfoUpdate(replicaName string, replicaStatus *EngineReplicaStatus) bool {
-	if replicaStatus.Mode == types.ModeRW || replicaStatus.Mode == types.ModeWO {
+func (e *Engine) ensureReplicaModeForInfoUpdate(replicaName string, replicaStatus Upstream) bool {
+	if replicaStatus.Mode() == types.ModeRW || replicaStatus.Mode() == types.ModeWO {
 		return true
 	}
-	if replicaStatus.Mode != types.ModeERR {
+	if replicaStatus.Mode() != types.ModeERR {
 		e.log.Warnf("Engine found unexpected mode for replica %s with address %s during info update from replica, mark the mode from %v to ERR and continue info update for other replicas",
-			replicaName, replicaStatus.Address, replicaStatus.Mode)
-		replicaStatus.Mode = types.ModeERR
+			replicaName, replicaStatus.Address(), replicaStatus.Mode())
+		replicaStatus.SetMode(types.ModeERR)
 	}
 	return false
 }
 
-// inspectReplicaForInfoUpdate validates and inspects a replica as an info source candidate.
+// inspectReplicaForInfoUpdate validates and inspects an upstream as an info source candidate.
 //
-// Here, "info source" means the replica selected as the source of truth for this update round,
-// i.e. the replica whose data may be used to update engine state such as SnapshotMap, Head,
+// Here, "info source" means the upstream selected as the source of truth for this update round,
+// i.e. the upstream whose data may be used to update engine state such as SnapshotMap, Head,
 // and ActualSize.
 //
 // Flow:
-//  1. Build replica service client and fetch replica object.
-//  2. If the replica is WO (rebuilding), only check shallow-copy state; do not use it as an info source.
-//  3. If the replica is RW, resolve its ancestor (backing image snapshot / oldest snapshot / head)
+//  1. Fetch the upstream view via Upstream.Get() (ReplicaGet for RAID1, ShardGroupGet for EC).
+//  2. If the upstream is WO (rebuilding), only check shallow-copy state; do not use it as an info source.
+//  3. If the upstream is RW, resolve its ancestor (backing image snapshot / oldest snapshot / head)
 //     based on current global context (hasBackingImage, hasSnapshot).
-func (e *Engine) inspectReplicaForInfoUpdate(replicaName string, replicaStatus *EngineReplicaStatus, hasBackingImage bool, hasSnapshot bool) (*replicaInspection, bool) {
-	replicaServiceCli, err := GetServiceClient(replicaStatus.Address)
+func (e *Engine) inspectReplicaForInfoUpdate(replicaName string, replicaStatus Upstream, hasBackingImage bool, hasSnapshot bool) (*replicaInspection, bool) {
+	view, err := replicaStatus.Get()
 	if err != nil {
-		e.log.WithError(err).Errorf("Engine failed to get service client for replica %s with address %s, will skip this replica and continue info update for other replicas", replicaName, replicaStatus.Address)
-		return nil, false
-	}
-	defer func() {
-		if errClose := replicaServiceCli.Close(); errClose != nil {
-			e.log.WithError(errClose).Errorf("Engine failed to close replica %s client with address %s during check and update info from replica", replicaName, replicaStatus.Address)
-		}
-	}()
-
-	replica, err := replicaServiceCli.ReplicaGet(replicaName)
-	if err != nil {
-		e.log.WithError(err).Warnf("Engine failed to get replica %s with address %s, mark the mode from %v to ERR", replicaName, replicaStatus.Address, replicaStatus.Mode)
-		replicaStatus.Mode = types.ModeERR
+		e.log.WithError(err).Warnf("Engine failed to get upstream %s with address %s, mark the mode from %v to ERR", replicaName, replicaStatus.Address(), replicaStatus.Mode())
+		replicaStatus.SetMode(types.ModeERR)
 		return nil, false
 	}
 
-	if replicaStatus.Mode == types.ModeWO {
-		if err := e.handleWOReplicaDuringInfoUpdate(replicaServiceCli, replicaName, replicaStatus); err != nil {
+	if replicaStatus.Mode() == types.ModeWO {
+		if err := e.handleWOReplicaDuringInfoUpdate(replicaName, replicaStatus); err != nil {
 			e.log.WithError(err).Warn("Skip WO replica during info update")
 		}
 		return nil, false
 	}
 
-	inspection := &replicaInspection{replica: replica}
-	ancestor, foundBackingImage, foundSnapshot, ok := e.resolveReplicaAncestor(replicaServiceCli, replicaName, replica, replicaStatus, hasBackingImage, hasSnapshot)
+	inspection := &replicaInspection{view: view}
+	ancestor, foundBackingImage, foundSnapshot, ok := e.resolveReplicaAncestor(replicaName, view, replicaStatus, hasBackingImage, hasSnapshot)
 	if !ok {
 		return nil, false
 	}
@@ -2968,54 +3227,67 @@ func (e *Engine) inspectReplicaForInfoUpdate(replicaName string, replicaStatus *
 	return inspection, true
 }
 
-func (e *Engine) handleWOReplicaDuringInfoUpdate(replicaServiceCli *client.SPDKClient, replicaName string, replicaStatus *EngineReplicaStatus) error {
-	shallowCopyStatus, err := replicaServiceCli.ReplicaRebuildingDstShallowCopyCheck(replicaName)
+// handleWOReplicaDuringInfoUpdate inspects a rebuilding (WO) RAID1 replica's
+// shallow-copy state. WO is RAID1-only — EC volumes do not surface
+// rebuild-in-progress at the engine layer (rebuild is driven inside the
+// ShardGroup process via ShardGroupShardRebuildStart). The lazy SPDK client
+// is constructed inline because this is the only RAID1-specific use of
+// ReplicaRebuildingDstShallowCopyCheck and it is not on the Upstream
+// interface.
+func (e *Engine) handleWOReplicaDuringInfoUpdate(replicaName string, replicaStatus Upstream) error {
+	cli, err := GetServiceClient(replicaStatus.Address())
+	if err != nil {
+		return errors.Wrapf(err, "failed to get service client for replica %s during WO shallow-copy check", replicaName)
+	}
+	defer func() { _ = cli.Close() }()
+
+	shallowCopyStatus, err := cli.ReplicaRebuildingDstShallowCopyCheck(replicaName)
 	if err != nil {
 		return errors.Wrapf(err, "Engine failed to get rebuilding replica %s shallow copy info, will skip this replica and continue info update for other replicas", replicaName)
 	}
 	if shallowCopyStatus.TotalState == helpertypes.ShallowCopyStateError || shallowCopyStatus.Error != "" {
-		replicaStatus.Mode = types.ModeERR
+		replicaStatus.SetMode(types.ModeERR)
 		return fmt.Errorf("Engine found rebuilding replica %s error %v during info update from replica, will mark the mode from WO to ERR and continue info update for other replicas", replicaName, shallowCopyStatus.Error)
 	}
 	// rebuilding replica is not used as info source
 	return nil
 }
 
-// resolveReplicaAncestor determines the ancestor lvol used to compare replica lineage
+// resolveReplicaAncestor determines the ancestor lvol used to compare upstream lineage
 // during engine info refresh.
 //
-// Selection order per replica:
-// 1. Backing image snapshot (if the replica has a backing image)
+// Selection order per upstream:
+// 1. Backing image snapshot (if the upstream has a backing image)
 // 2. Oldest snapshot (snapshot with empty Parent)
 // 3. Head (when no snapshots exist)
 //
-// It also enforces cross-replica consistency for this round:
-// - If any replica has backing image lineage, replicas without backing image lineage are skipped.
-// - If any replica has snapshot lineage (and no backing image lineage), replicas without snapshots are skipped.
+// It also enforces cross-upstream consistency for this round:
+// - If any upstream has backing image lineage, upstreams without backing image lineage are skipped.
+// - If any upstream has snapshot lineage (and no backing image lineage), upstreams without snapshots are skipped.
 //
 // Returns:
 // - ancestor: selected lvol for lineage/creation-time comparison.
-// - foundBackingImage: true if this replica contributes backing-image lineage.
-// - foundSnapshot: true if this replica contributes snapshot lineage.
-// - ok: false when the replica should be skipped (inconsistent lineage, missing ancestor, or lookup failure).
-func (e *Engine) resolveReplicaAncestor(replicaServiceCli *client.SPDKClient, replicaName string,
-	replica *api.Replica, replicaStatus *EngineReplicaStatus, hasBackingImage bool, hasSnapshot bool) (ancestor *api.Lvol, foundBackingImage bool, foundSnapshot bool, ok bool) {
-	if replica.BackingImageName != "" {
-		backingImage, err := replicaServiceCli.BackingImageGet(replica.BackingImageName, replica.LvsUUID)
+// - foundBackingImage: true if this upstream contributes backing-image lineage.
+// - foundSnapshot: true if this upstream contributes snapshot lineage.
+// - ok: false when the upstream should be skipped (inconsistent lineage, missing ancestor, or lookup failure).
+func (e *Engine) resolveReplicaAncestor(replicaName string, view *UpstreamView,
+	replicaStatus Upstream, hasBackingImage bool, hasSnapshot bool) (ancestor *api.Lvol, foundBackingImage bool, foundSnapshot bool, ok bool) {
+	if view.BackingImageName != "" {
+		backingImage, err := replicaStatus.BackingImageGet(view.BackingImageName, view.LvsUUID)
 		if err != nil {
-			e.log.WithError(err).Warnf("Failed to get backing image %s with disk UUID %s from replica %s head parent %s, will mark the mode from %v to ERR and continue info update for other replicas", replica.BackingImageName, replica.LvsUUID, replicaName, replica.Head.Parent, replicaStatus.Mode)
-			replicaStatus.Mode = types.ModeERR
+			e.log.WithError(err).Warnf("Failed to get backing image %s with disk UUID %s from replica %s head parent %s, will mark the mode from %v to ERR and continue info update for other replicas", view.BackingImageName, view.LvsUUID, replicaName, view.Head.Parent, replicaStatus.Mode())
+			replicaStatus.SetMode(types.ModeERR)
 			return nil, false, false, false
 		}
-		return backingImage.Snapshot, true, len(replica.Snapshots) > 0, true
+		return backingImage.Snapshot, true, len(view.Snapshots) > 0, true
 	}
 
-	if len(replica.Snapshots) > 0 {
+	if len(view.Snapshots) > 0 {
 		if hasBackingImage {
 			e.log.Warnf("Engine found replica %s does not have a backing image while other replicas have during info update for other replicas", replicaName)
 			return nil, false, false, false
 		}
-		for _, snapApiLvol := range replica.Snapshots {
+		for _, snapApiLvol := range view.Snapshots {
 			if snapApiLvol.Parent == "" {
 				return snapApiLvol, false, true, true
 			}
@@ -3028,7 +3300,11 @@ func (e *Engine) resolveReplicaAncestor(replicaServiceCli *client.SPDKClient, re
 		e.log.Warnf("Engine found replica %s does not have a snapshot while other replicas have during info update for other replicas", replicaName)
 		return nil, false, false, false
 	}
-	return replica.Head, false, false, true
+	if view.Head == nil {
+		e.log.Warnf("Engine found upstream %s does not have a head lvol during info update", replicaName)
+		return nil, false, false, false
+	}
+	return view.Head, false, false, true
 }
 
 // selectAndApplyEarliestReplicaInfo chooses one replica as the engine info source
@@ -3050,7 +3326,7 @@ func (e *Engine) resolveReplicaAncestor(replicaServiceCli *client.SPDKClient, re
 // Notes:
 // - Replicas with invalid/unparsable ancestor CreationTime are skipped.
 // - If no valid candidate remains, engine state is left unchanged.
-func (e *Engine) selectAndApplyEarliestReplicaInfo(replicaMap map[string]*api.Replica, replicaAncestorMap map[string]*api.Lvol, hasBackingImage bool, hasSnapshot bool) {
+func (e *Engine) selectAndApplyEarliestReplicaInfo(replicaViewMap map[string]*UpstreamView, replicaAncestorMap map[string]*api.Lvol, hasBackingImage bool, hasSnapshot bool) {
 	candidateReplicaName := ""
 	earliestCreationTime := time.Now()
 
@@ -3069,9 +3345,9 @@ func (e *Engine) selectAndApplyEarliestReplicaInfo(replicaMap map[string]*api.Re
 		}
 
 		earliestCreationTime = creationTime
-		e.SnapshotMap = replicaMap[replicaName].Snapshots
-		e.Head = replicaMap[replicaName].Head
-		e.ActualSize = replicaMap[replicaName].ActualSize
+		e.SnapshotMap = replicaViewMap[replicaName].Snapshots
+		e.Head = replicaViewMap[replicaName].Head
+		e.ActualSize = replicaViewMap[replicaName].ActualSize
 
 		if candidateReplicaName != "" && candidateReplicaName != replicaName {
 			e.logReplicaAncestorSwitch(candidateReplicaName, replicaName, replicaAncestorMap)
@@ -3081,6 +3357,10 @@ func (e *Engine) selectAndApplyEarliestReplicaInfo(replicaMap map[string]*api.Re
 }
 
 func shouldConsiderAncestor(ancestor *api.Lvol, replicaName string, hasBackingImage bool, hasSnapshot bool) bool {
+	if ancestor == nil {
+		return false
+	}
+
 	if hasBackingImage {
 		return ancestor.Name != types.VolumeHead && !IsReplicaSnapshotLvol(replicaName, ancestor.Name)
 	}
@@ -3132,15 +3412,15 @@ func (e *Engine) validateAndUpdateReplicaNvme(replicaName string, bdev *spdktype
 		return types.ModeERR, err
 	}
 
-	replicaStatus := e.ReplicaStatusMap[replicaName]
-	if err := validateReplicaAddress(replicaName, bdev.Name, replicaStatus.Address, nvmeInfo); err != nil {
+	replicaStatus := e.upstreams[replicaName]
+	if err := validateReplicaAddress(replicaName, bdev.Name, replicaStatus.Address(), nvmeInfo); err != nil {
 		return types.ModeERR, err
 	}
-	if err := validateControllerName(replicaName, bdev.Name, replicaStatus.BdevName); err != nil {
+	if err := validateControllerName(replicaName, bdev.Name, replicaStatus.BdevName()); err != nil {
 		return types.ModeERR, err
 	}
 
-	return replicaStatus.Mode, nil
+	return replicaStatus.Mode(), nil
 }
 
 // ensureRebuildingReplicaSize checks the dst replica's spec size against the engine spec size
@@ -3197,11 +3477,17 @@ func validateAndGetSingleNvmeInfo(replicaName string, bdev *spdktypes.BdevInfo) 
 }
 
 func validateNvmeTransport(replicaName, bdevName string, nvmeInfo spdktypes.NvmeNamespaceInfo) error {
-	if !strings.EqualFold(string(nvmeInfo.Trid.Adrfam), string(spdktypes.NvmeAddressFamilyIPv4)) ||
-		!strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeTCP)) {
+	if !strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeTCP)) {
 		return fmt.Errorf(
-			"found invalid address family %s and transport type %s in a remote NVMe base bdev %s during replica %s mode validation",
-			nvmeInfo.Trid.Adrfam, nvmeInfo.Trid.Trtype, bdevName, replicaName,
+			"found invalid transport type %s in a remote NVMe base bdev %s during replica %s mode validation",
+			nvmeInfo.Trid.Trtype, bdevName, replicaName,
+		)
+	}
+	if !strings.EqualFold(string(nvmeInfo.Trid.Adrfam), string(spdktypes.NvmeAddressFamilyIPv4)) &&
+		!strings.EqualFold(string(nvmeInfo.Trid.Adrfam), string(spdktypes.NvmeAddressFamilyIPv6)) {
+		return fmt.Errorf(
+			"found invalid address family %s in a remote NVMe base bdev %s during replica %s mode validation",
+			nvmeInfo.Trid.Adrfam, bdevName, replicaName,
 		)
 	}
 	return nil
@@ -3252,4 +3538,32 @@ func (e *Engine) SetReplicaAddFinishUnlockedHook(hook func()) {
 	e.Lock()
 	defer e.Unlock()
 	e.replicaAddFinishUnlockedHook = hook
+}
+
+func GetBackendReplicaURL(address string) string {
+	return "tcp://" + address
+}
+
+// ensureNvmeTcpTargetForRestore creates a temporary NVMe-TCP target if the engine does not
+// already have one (e.g. engines with Frontend = ""). Called by EngineFrontend before
+// connecting its restore initiator so that the target address is available.
+func (e *Engine) ensureNvmeTcpTargetForRestore(spdkClient *spdkclient.Client, superiorPortAllocator *commonbitmap.Bitmap) error {
+	e.Lock()
+	defer e.Unlock()
+
+	if e.NvmeTcpTarget.IP != "" && e.NvmeTcpTarget.Port != 0 {
+		return nil // target already present (e.g. from a prior partial restore attempt)
+	}
+
+	e.log.Info("Creating temporary NVMe-TCP target for backup restore")
+	if err := e.createNVMeTCPTarget(spdkClient, superiorPortAllocator, 1, NvmeTCPANAStateOptimized); err != nil {
+		if relErr := e.releasePorts(superiorPortAllocator); relErr != nil {
+			e.log.WithError(relErr).Warn("Failed to release ports after temporary NVMe-TCP target creation failure")
+		}
+		e.NvmeTcpTarget.IP = ""
+		e.NvmeTcpTarget.Nguid = ""
+		e.NvmeTcpTarget.Nqn = ""
+		return errors.Wrap(err, "failed to create temporary NVMe-TCP target for backup restore")
+	}
+	return nil
 }

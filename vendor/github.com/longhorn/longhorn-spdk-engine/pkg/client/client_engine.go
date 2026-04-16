@@ -13,8 +13,13 @@ import (
 	"github.com/longhorn/longhorn-spdk-engine/pkg/util"
 )
 
-// EngineCreate creates and starts an engine instance with the requested replicas.
-func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize uint64, replicaAddressMap map[string]string, portCount int32, salvageRequested bool) (*api.Engine, error) {
+// EngineCreate creates and starts an engine instance with the requested
+// replicas. dataLayoutType selects the upstream-RPC dispatch on the server:
+// DATA_LAYOUT_TYPE_REPLICATED constructs replicaUpstream entries (RAID1),
+// DATA_LAYOUT_TYPE_SHARDED constructs a single shardGroupUpstream (EC).
+// Without forwarding this field, callers would default to the proto3 zero
+// value (REPLICATED), and EC volumes would be silently miscreated as RAID1.
+func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize uint64, replicaAddressMap map[string]string, portCount int32, salvageRequested bool, dataLayoutType spdkrpc.DataLayoutType) (*api.Engine, error) {
 	if name == "" {
 		return nil, fmt.Errorf("failed to start engine: missing required parameter name")
 	}
@@ -37,6 +42,7 @@ func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize ui
 		ReplicaAddressMap: replicaAddressMap,
 		PortCount:         portCount,
 		SalvageRequested:  salvageRequested,
+		DataLayoutType:    dataLayoutType,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to start engine")
@@ -439,7 +445,6 @@ func (c *SPDKClient) EngineBackupRestore(req *BackupRestoreRequest) error {
 	recv, err := client.EngineBackupRestore(ctx, &spdkrpc.EngineBackupRestoreRequest{
 		BackupUrl:       req.BackupUrl,
 		EngineName:      req.EngineName,
-		SnapshotName:    req.SnapshotName,
 		Credential:      req.Credential,
 		ConcurrentLimit: req.ConcurrentLimit,
 	})

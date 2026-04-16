@@ -48,6 +48,9 @@ type Server struct {
 	engineMap         map[string]*Engine
 	engineFrontendMap map[string]*EngineFrontend
 
+	shardMap      map[string]*Shard
+	shardGroupMap map[string]*ShardGroup
+
 	backupMap map[string]*Backup
 
 	// We store BackingImage in each lvstore
@@ -88,7 +91,7 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 	broadcasters := map[types.InstanceType]*broadcaster.Broadcaster{}
 	broadcastChs := map[types.InstanceType]chan interface{}{}
 	updateChs := map[types.InstanceType]chan interface{}{}
-	for _, t := range []types.InstanceType{types.InstanceTypeReplica, types.InstanceTypeEngine, types.InstanceTypeEngineFrontend, types.InstanceTypeBackingImage} {
+	for _, t := range []types.InstanceType{types.InstanceTypeReplica, types.InstanceTypeEngine, types.InstanceTypeEngineFrontend, types.InstanceTypeBackingImage, types.InstanceTypeShard, types.InstanceTypeShardGroup} {
 		broadcasters[t] = &broadcaster.Broadcaster{}
 		broadcastChs[t] = make(chan interface{})
 		updateChs[t] = make(chan interface{})
@@ -107,6 +110,9 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 		replicaMap:        map[string]*Replica{},
 		engineMap:         map[string]*Engine{},
 		engineFrontendMap: map[string]*EngineFrontend{},
+
+		shardMap:      map[string]*Shard{},
+		shardGroupMap: map[string]*ShardGroup{},
 
 		backupMap: map[string]*Backup{},
 
@@ -130,6 +136,12 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 		return nil, err
 	}
 	if _, err := s.broadcasters[types.InstanceTypeBackingImage].Subscribe(ctx, s.backingImageBroadcastConnector); err != nil {
+		return nil, err
+	}
+	if _, err := s.broadcasters[types.InstanceTypeShard].Subscribe(ctx, s.shardBroadcastConnector); err != nil {
+		return nil, err
+	}
+	if _, err := s.broadcasters[types.InstanceTypeShardGroup].Subscribe(ctx, s.shardGroupBroadcastConnector); err != nil {
 		return nil, err
 	}
 
@@ -218,6 +230,11 @@ type verifyState struct {
 	engineFrontendForSync map[string]*EngineFrontend
 	backingImageMap       map[string]*BackingImage
 	backingImageForSync   map[string]*BackingImage
+	shardMap              map[string]*Shard
+	shardMapForSync       map[string]*Shard
+	shardGroupMap         map[string]*ShardGroup
+	shardGroupMapForSync  map[string]*ShardGroup
+	lvsUUIDToDiskID       map[string]string
 	spdkClient            *spdkclient.Client
 }
 
@@ -247,6 +264,8 @@ func (s *Server) verify() (err error) {
 
 	s.replicaMap = state.replicaMap
 	s.backingImageMap = state.backingImageMap
+	s.shardMap = state.shardMap
+	s.shardGroupMap = state.shardGroupMap
 	s.UpdateEngineMetrics()
 	s.Unlock()
 
@@ -261,6 +280,11 @@ func (s *Server) newVerifyState() *verifyState {
 		engineFrontendForSync: map[string]*EngineFrontend{},
 		backingImageMap:       map[string]*BackingImage{},
 		backingImageForSync:   map[string]*BackingImage{},
+		shardMap:              map[string]*Shard{},
+		shardMapForSync:       map[string]*Shard{},
+		shardGroupMap:         map[string]*ShardGroup{},
+		shardGroupMapForSync:  map[string]*ShardGroup{},
+		lvsUUIDToDiskID:       map[string]string{},
 		spdkClient:            s.spdkClient,
 	}
 
@@ -277,6 +301,22 @@ func (s *Server) newVerifyState() *verifyState {
 	for k, v := range s.backingImageMap {
 		state.backingImageMap[k] = v
 		state.backingImageForSync[k] = v
+	}
+	for k, v := range s.shardMap {
+		state.shardMap[k] = v
+		state.shardMapForSync[k] = v
+	}
+	for k, v := range s.shardGroupMap {
+		state.shardGroupMap[k] = v
+		state.shardGroupMapForSync[k] = v
+	}
+	for diskID, disk := range s.diskMap {
+		disk.RLock()
+		lvsUUID := disk.UUID
+		disk.RUnlock()
+		if lvsUUID != "" {
+			state.lvsUUIDToDiskID[lvsUUID] = diskID
+		}
 	}
 
 	return state
@@ -370,6 +410,9 @@ func (s *Server) rebuildCachedLvolObjects(state *verifyState) error {
 		if state.replicaMap[lvolName] != nil {
 			continue
 		}
+		if state.shardMap[lvolName] != nil {
+			continue
+		}
 		if state.backingImageMap[lvolName] != nil {
 			continue
 		}
@@ -414,6 +457,19 @@ func (s *Server) rebuildCachedLvolObjects(state *verifyState) error {
 			state.replicaMap[lvolName] = NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.updateChs[types.InstanceTypeReplica])
 			state.replicaMapForSync[lvolName] = state.replicaMap[lvolName]
 			logrus.Infof("Detected one possible existing replica %s(%s) with disk %s(%s), spec size %d, actual size %d", bdevLvol.Aliases[0], bdevLvol.UUID, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, actualSize)
+		} else if IsProbablyShardName(lvolName) {
+			lvsUUID := bdevLvol.DriverSpecific.Lvol.LvolStoreUUID
+			volumeName, slotIndex, err := ParseShardName(lvolName)
+			if err != nil {
+				logrus.WithError(err).Warnf("Failed to parse shard name %s, skipping", lvolName)
+				continue
+			}
+			specSize := bdevLvol.NumBlocks * uint64(bdevLvol.BlockSize)
+			shard := NewShard(s.ctx, volumeName, slotIndex, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, s.updateChs[types.InstanceTypeShard])
+			shard.UUID = bdevLvol.UUID
+			state.shardMap[lvolName] = shard
+			state.shardMapForSync[lvolName] = shard
+			logrus.Infof("Detected one possible existing shard %s(%s) with lvstore %s(%s), spec size %d", bdevLvol.Aliases[0], bdevLvol.UUID, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize)
 		}
 	}
 
@@ -469,6 +525,18 @@ func (s *Server) syncVerifiedObjects(state *verifyState) error {
 		}
 	}
 
+	for _, sh := range state.shardMapForSync {
+		if err := sh.Sync(state.spdkClient); err != nil && jsonrpc.IsJSONRPCRespErrorBrokenPipe(err) {
+			return err
+		}
+	}
+
+	for _, sg := range state.shardGroupMapForSync {
+		if err := sg.Sync(state.spdkClient); err != nil && jsonrpc.IsJSONRPCRespErrorBrokenPipe(err) {
+			return err
+		}
+	}
+
 	// TODO: send update signals if there is a Replica/Replica change
 	return nil
 }
@@ -487,6 +555,8 @@ func (s *Server) broadcasting() {
 				case <-s.updateChs[types.InstanceTypeEngine]:
 				case <-s.updateChs[types.InstanceTypeEngineFrontend]:
 				case <-s.updateChs[types.InstanceTypeBackingImage]:
+				case <-s.updateChs[types.InstanceTypeShard]:
+				case <-s.updateChs[types.InstanceTypeShardGroup]:
 				}
 			}
 		case <-s.updateChs[types.InstanceTypeReplica]:
@@ -497,6 +567,10 @@ func (s *Server) broadcasting() {
 			s.broadcastChs[types.InstanceTypeEngineFrontend] <- nil
 		case <-s.updateChs[types.InstanceTypeBackingImage]:
 			s.broadcastChs[types.InstanceTypeBackingImage] <- nil
+		case <-s.updateChs[types.InstanceTypeShard]:
+			s.broadcastChs[types.InstanceTypeShard] <- nil
+		case <-s.updateChs[types.InstanceTypeShardGroup]:
+			s.broadcastChs[types.InstanceTypeShardGroup] <- nil
 		}
 	}
 }
@@ -511,6 +585,10 @@ func (s *Server) Subscribe(instanceType types.InstanceType) (<-chan interface{},
 		return s.broadcasters[types.InstanceTypeReplica].Subscribe(context.TODO(), s.replicaBroadcastConnector)
 	case types.InstanceTypeBackingImage:
 		return s.broadcasters[types.InstanceTypeBackingImage].Subscribe(context.TODO(), s.backingImageBroadcastConnector)
+	case types.InstanceTypeShard:
+		return s.broadcasters[types.InstanceTypeShard].Subscribe(context.TODO(), s.shardBroadcastConnector)
+	case types.InstanceTypeShardGroup:
+		return s.broadcasters[types.InstanceTypeShardGroup].Subscribe(context.TODO(), s.shardGroupBroadcastConnector)
 	}
 	return nil, fmt.Errorf("invalid instance type %v for subscription", instanceType)
 }
@@ -529,6 +607,14 @@ func (s *Server) engineFrontendBroadcastConnector() (chan interface{}, error) {
 
 func (s *Server) backingImageBroadcastConnector() (chan interface{}, error) {
 	return s.broadcastChs[types.InstanceTypeBackingImage], nil
+}
+
+func (s *Server) shardBroadcastConnector() (chan interface{}, error) {
+	return s.broadcastChs[types.InstanceTypeShard], nil
+}
+
+func (s *Server) shardGroupBroadcastConnector() (chan interface{}, error) {
+	return s.broadcastChs[types.InstanceTypeShardGroup], nil
 }
 
 func (s *Server) isLvsExist(lvsUUID, lvsName string) (bool, error) {

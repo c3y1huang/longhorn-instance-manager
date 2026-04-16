@@ -8,12 +8,14 @@ replace github.com/longhorn/types => ../types
 
 replace github.com/longhorn/go-spdk-helper => ../go-spdk-helper
 
+replace github.com/longhorn/longhorn-spdk-engine => ../longhorn-spdk-engine
+
 require (
 	github.com/cockroachdb/errors v1.12.0
 	github.com/google/uuid v1.6.0
 	github.com/longhorn/backupstore v0.0.0-20260414054550-8570535ce7ad
 	github.com/longhorn/go-common-libs v0.0.0-20260502161928-1e84fa75a8f1
-	github.com/longhorn/go-spdk-helper v0.5.1-0.20260416023608-49b12f8b468b
+	github.com/longhorn/go-spdk-helper v0.6.1-0.20260502161311-a7689bc3c0e4
 	github.com/longhorn/longhorn-engine v1.12.0-dev-20260405
 	github.com/longhorn/longhorn-spdk-engine v0.0.0-20260420061538-8ea1811c69c3
 	github.com/longhorn/types v0.0.0-20260417071722-2f1958bc30e5
@@ -119,9 +121,9 @@ require (
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	k8s.io/api v0.35.3 // indirect
-	k8s.io/apimachinery v0.35.3 // indirect
-	k8s.io/client-go v0.35.3 // indirect
+	k8s.io/api v0.35.4 // indirect
+	k8s.io/apimachinery v0.35.4 // indirect
+	k8s.io/client-go v0.35.4 // indirect
 	k8s.io/klog/v2 v2.130.1 // indirect
 	k8s.io/kube-openapi v0.0.0-20250910181357-589584f1c912 // indirect
 	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4 // indirect
