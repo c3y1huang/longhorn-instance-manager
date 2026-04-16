@@ -6,11 +6,13 @@ toolchain go1.26.1
 
 replace github.com/longhorn/types => ../types
 
+replace github.com/longhorn/go-spdk-helper => ../go-spdk-helper
+
 require (
 	github.com/cockroachdb/errors v1.12.0
 	github.com/google/uuid v1.6.0
 	github.com/longhorn/backupstore v0.0.0-20260414054550-8570535ce7ad
-	github.com/longhorn/go-common-libs v0.0.0-20260328134226-cafa38fc4ce8
+	github.com/longhorn/go-common-libs v0.0.0-20260502161928-1e84fa75a8f1
 	github.com/longhorn/go-spdk-helper v0.5.1-0.20260416023608-49b12f8b468b
 	github.com/longhorn/longhorn-engine v1.12.0-dev-20260405
 	github.com/longhorn/longhorn-spdk-engine v0.0.0-20260420061538-8ea1811c69c3
@@ -106,7 +108,7 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
+	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
