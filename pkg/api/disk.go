@@ -27,6 +27,18 @@ type ReplicaStorageInstance struct {
 	ActualSize uint64
 }
 
+// ShardStorageInstance represents a shard logical volume (lvol) of an EC volume.
+type ShardStorageInstance struct {
+	Name       string
+	UUID       string
+	DiskName   string
+	DiskUUID   string
+	SpecSize   uint64
+	ActualSize uint64
+	SlotIndex  uint32
+	VolumeName string
+}
+
 type DiskMetrics struct {
 	ReadThroughput  uint64
 	WriteThroughput uint64
