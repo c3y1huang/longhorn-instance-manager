@@ -4,6 +4,8 @@ go 1.25.3
 
 toolchain go1.26.1
 
+replace github.com/longhorn/types => ../types
+
 require (
 	github.com/cockroachdb/errors v1.12.0
 	github.com/google/uuid v1.6.0

@@ -169,8 +169,6 @@ github.com/longhorn/longhorn-spdk-engine v0.0.0-20260420061538-8ea1811c69c3 h1:P
 github.com/longhorn/longhorn-spdk-engine v0.0.0-20260420061538-8ea1811c69c3/go.mod h1:bcCJepCHUsmUXYv/sUBm4K0YEAVsRx/NuanZMVoTrHI=
 github.com/longhorn/sparse-tools v0.0.0-20260327124327-3fac691f3c28 h1:kKUqjcnnDvMiKJZl9kotwTd8WLnlmI6cTUK70L/Wpsc=
 github.com/longhorn/sparse-tools v0.0.0-20260327124327-3fac691f3c28/go.mod h1:QMqtMZUXb4Fu9d2SpgG88PAytnMjIsW/hFqhGUsFP+w=
-github.com/longhorn/types v0.0.0-20260417071722-2f1958bc30e5 h1:kZMVXdShXQUEagwzvuayZDu5W8mpRyGI0pcHXaiTKrg=
-github.com/longhorn/types v0.0.0-20260417071722-2f1958bc30e5/go.mod h1:qLF81pbxPxRteatoPFqVjcr0FPga839D8Cj2k1V4/1c=
 github.com/mailru/easyjson v0.7.7 h1:UGYAvKxe3sBsEDzO8ZeWOSlIQfWFlxbzLZe7hwFURr0=
 github.com/mailru/easyjson v0.7.7/go.mod h1:xzfreul335JAWq5oZzymOObrkdz5UnU4kGfJJLY9Nlc=
 github.com/matttproud/golang_protobuf_extensions v1.0.1/go.mod h1:D8He9yQNgCq6Z5Ld7szi9bcBfOoFv/3dc6xSMkL2PC0=
