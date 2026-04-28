@@ -11,6 +11,10 @@ export SRC_TAG := $(shell git tag --points-at HEAD | head -n 1)
 export CACHEBUST := $(shell date +%s)
 
 .PHONY: build validate test ci package
+
+# dev: build validate test package
+dev: build package
+
 build:
 	docker buildx build --target build-artifacts --output type=local,dest=. -f Dockerfile .
 
@@ -48,4 +52,4 @@ workflow-manifest-image:
 	  ${REPO}/longhorn-instance-manager:${TAG}-amd64 \
 	  ${REPO}/longhorn-instance-manager:${TAG}-arm64
 
-.DEFAULT_GOAL := ci
+.DEFAULT_GOAL := dev
