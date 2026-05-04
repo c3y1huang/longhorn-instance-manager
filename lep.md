@@ -2204,7 +2204,7 @@ For engine enhancement, also requires engine integration test plan.
 1. **EC volume CRUD lifecycle**
     - Create EC volume (4+2, 64KB strip) -> verify k+m Shard CRs created, ShardGroup CR healthy, engine running
     - Attach EC volume -> mount filesystem, write data, read back, verify integrity
-    - Detach EC volume -> verify clean teardown (frontend unexport, EC bdev delete, NVMe-oF detach)
+    - Detach EC volume -> verify clean teardown (frontend unexport, engine-side NVMe-oF detach) and verify ShardGroup process keeps running with EC bdev/lvstore/head-lvol preserved
     - Delete EC volume -> verify ShardGroup and Shard CRs garbage collected, shard lvols deleted on shard nodes
 
 2. **Snapshot/Clone/Revert on EC volume**
@@ -2289,7 +2289,7 @@ This table compares Longhorn features across V2 RAID1 replication and the EC sha
 | Backup (`BackupCreate` / `BackupStatus`) | ✓ | ✗ | Returns `Unimplemented`; backup path delegates to per-replica RPCs that have no EC equivalent |
 | Restore (`BackupRestore` / `RestoreStatus` / `RestoreFinish`) | ✓ | ✗ | Returns `Unimplemented`; same constraint as backup |
 | DR volume (standby) | ✓ | ✗ | Deferred; depends on backup/restore support |
-| Shard/replica failure detection + degraded mode | ✓ | ✓ | EC: slot FAILED detected via `bdev_ec_get_bdevs` polling in `validateAndUpdateECNoLock` |
+| Shard/replica failure detection + degraded mode | ✓ | ✓ | EC: slot FAILED detected via `bdev_ec_get_bdevs` polling in the ShardGroup process and exposed via `ShardGroupGet` |
 | Shard/replica replacement + rebuild | ✓ | ✓ | EC: two-step `ShardGroupShardReplace` + `ShardGroupShardRebuildStart` (both target the ShardGroup process) |
 | Rebuild bandwidth control (QoS) | ✓ | ✓ | EC: `ShardGroupShardRebuildQosSet` wrapping `bdev_ec_set_rebuild_qos` (ShardGroup process) |
 | Crash recovery (engine node) | ✓ | ✓ | EC: `bdev_ec_create` with WIB load + startup scrub; `RecreateEC` tolerates missing shards |

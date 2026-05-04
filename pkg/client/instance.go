@@ -96,10 +96,6 @@ type EngineCreateRequest struct {
 	TargetAddress     string
 	UpgradeRequired   bool
 	SalvageRequested  bool
-	EcShards          map[string]*rpc.EcShardInfo
-	EcDataChunks      uint32
-	EcParityChunks    uint32
-	EcStripSizeKb     uint32
 }
 
 type EngineFrontendCreateRequest struct {
@@ -124,6 +120,17 @@ type ShardCreateRequest struct {
 	PortCount int32
 }
 
+// ShardGroupCreateRequest carries the EC creation parameters for a ShardGroup
+// process instance. Populated by the longhorn-manager and shipped via
+// SpdkInstanceSpec.shard_group_spec when the instance type is "shardgroup".
+type ShardGroupCreateRequest struct {
+	DataChunks       uint32
+	ParityChunks     uint32
+	StripSizeKb      uint32
+	Shards           map[string]*rpc.ShardEndpoint
+	SalvageRequested bool
+}
+
 type InstanceCreateRequest struct {
 	DataEngine   string
 	Name         string
@@ -140,6 +147,8 @@ type InstanceCreateRequest struct {
 	EngineFrontend EngineFrontendCreateRequest
 	Replica        ReplicaCreateRequest
 	Shard          ShardCreateRequest
+	ShardGroup     ShardGroupCreateRequest
+	DataLayoutType rpc.DataLayoutType
 
 	// Deprecated: replaced by DataEngine.
 	BackendStoreDriver string
@@ -178,14 +187,6 @@ func (c *InstanceServiceClient) InstanceCreate(req *InstanceCreateRequest) (*api
 				UblkQueueDepth:    int32(req.Engine.UblkQueueDepth),
 				UblkNumberOfQueue: int32(req.Engine.UblkNumberOfQueue),
 			}
-			if len(req.Engine.EcShards) > 0 {
-				spdkInstanceSpec.EcSpec = &rpc.EcSpec{
-					Shards:       req.Engine.EcShards,
-					DataChunks:   req.Engine.EcDataChunks,
-					ParityChunks: req.Engine.EcParityChunks,
-					StripSizeKb:  req.Engine.EcStripSizeKb,
-				}
-			}
 		case types.InstanceTypeEngineFrontend:
 			spdkInstanceSpec = &rpc.SpdkInstanceSpec{
 				Size:              req.Size,
@@ -208,6 +209,17 @@ func (c *InstanceServiceClient) InstanceCreate(req *InstanceCreateRequest) (*api
 				LvsName:   req.Shard.LvsName,
 				LvsUuid:   req.Shard.LvsUuid,
 				SlotIndex: req.Shard.SlotIndex,
+			}
+		case types.InstanceTypeShardGroup:
+			spdkInstanceSpec = &rpc.SpdkInstanceSpec{
+				Size: req.Size,
+				ShardGroupSpec: &rpc.ShardGroupSpec{
+					DataChunks:       req.ShardGroup.DataChunks,
+					ParityChunks:     req.ShardGroup.ParityChunks,
+					StripSizeKb:      req.ShardGroup.StripSizeKb,
+					Shards:           req.ShardGroup.Shards,
+					SalvageRequested: req.ShardGroup.SalvageRequested,
+				},
 			}
 		default:
 			return nil, fmt.Errorf("failed to create instance: invalid instance type %v", req.InstanceType)
@@ -243,6 +255,7 @@ func (c *InstanceServiceClient) InstanceCreate(req *InstanceCreateRequest) (*api
 				return ""
 			}(),
 		},
+		DataLayoutType: req.DataLayoutType,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create instance")
